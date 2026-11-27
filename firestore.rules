@@ -1,0 +1,219 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net — Deny-by-Default for all unmatched collections/documents
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Reusable Security Primitives
+    function isValidId(id) {
+      return id is string
+        && id.size() >= 1
+        && id.size() <= 128
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedEmail() {
+      return isSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+
+    // Strict one-time Bootstrap owner identity (ONLY for initial one-time bootstrap, NEVER grants isAdmin())
+    function isBootstrapOwnerIdentity() {
+      return isVerifiedEmail()
+        && request.auth.token.email.lower() == 'linhnk2013@gmail.com';
+    }
+
+    function isBootstrapNotInitialized() {
+      return !exists(/databases/$(database)/documents/adminSystem/bootstrap);
+    }
+
+    // D1 Single Source of Truth: Admin status comes EXCLUSIVELY from /admins/{request.auth.uid}
+    // Note: get() inside Security Rules bypasses match rules -> zero recursion with /admins/{adminUid} allow get.
+    // Accessing the same path within one evaluation is cached by Firestore Rules (1 document lookup).
+    function isAdmin() {
+      return isVerifiedEmail()
+        && isValidId(request.auth.uid)
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.uid == request.auth.uid
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true;
+    }
+
+    // 3. Validation Blueprints (synchronized with firebase-blueprint.json)
+    function isValidAdminRegistryEntry(data, adminUid) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'active', 'grantedByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'active', 'grantedByUid', 'createdAt', 'updatedAt'])
+        && data.uid is string
+        && data.uid == adminUid
+        && isValidId(data.uid)
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 254
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && data.role == 'admin'
+        && data.active is bool
+        && data.grantedByUid is string
+        && data.grantedByUid == request.auth.uid
+        && isValidId(data.grantedByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBootstrapLock(data) {
+      return data.keys().hasAll(['initialized', 'bootstrapAdminUid', 'bootstrapAdminEmail', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['initialized', 'bootstrapAdminUid', 'bootstrapAdminEmail', 'createdAt', 'updatedAt'])
+        && data.initialized == true
+        && data.bootstrapAdminUid is string
+        && data.bootstrapAdminUid == request.auth.uid
+        && isValidId(data.bootstrapAdminUid)
+        && data.bootstrapAdminEmail is string
+        && data.bootstrapAdminEmail.size() >= 3
+        && data.bootstrapAdminEmail.size() <= 254
+        && data.bootstrapAdminEmail.lower() == 'linhnk2013@gmail.com'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAdminSecurityConfig(data, configId) {
+      return data.keys().hasAll(['configKey', 'updatedByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['configKey', 'description', 'updatedByUid', 'createdAt', 'updatedAt'])
+        && data.configKey is string
+        && data.configKey == configId
+        && data.configKey.size() >= 1
+        && data.configKey.size() <= 64
+        && data.configKey.matches('^[a-zA-Z0-9_\\-]+$')
+        && (!('description' in data) || (data.description is string && data.description.size() <= 500))
+        && data.updatedByUid is string
+        && data.updatedByUid == request.auth.uid
+        && isValidId(data.updatedByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. Authorized Admin Registry (/admins/{adminUid}) — Single Source of Truth (D1)
+    match /admins/{adminUid} {
+      // Short-circuit: caller reading their OWN document costs 0 get()/exists() calls and never invokes isAdmin().
+      // Existing verified Admin may also GET another admin document by exact UID.
+      allow get: if isVerifiedEmail()
+        && isValidId(adminUid)
+        && (request.auth.uid == adminUid || isAdmin());
+
+      // Never allow listing the entire admins collection.
+      allow list: if false;
+
+      // Create: ONLY via (A) one-time atomic Bootstrap for own UID OR (B) active Admin adding ANOTHER UID.
+      allow create: if isVerifiedEmail()
+        && isValidId(adminUid)
+        && isValidAdminRegistryEntry(incoming(), adminUid)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          // (A) One-time atomic self-closing Bootstrap (strictly own UID, strictly before /adminSystem/bootstrap exists)
+          (
+            isBootstrapOwnerIdentity()
+            && adminUid == request.auth.uid
+            && incoming().email.lower() == 'linhnk2013@gmail.com'
+            && incoming().active == true
+            && isBootstrapNotInitialized()
+            && existsAfter(/databases/$(database)/documents/adminSystem/bootstrap)
+            && getAfter(/databases/$(database)/documents/adminSystem/bootstrap).data.initialized == true
+            && getAfter(/databases/$(database)/documents/adminSystem/bootstrap).data.bootstrapAdminUid == request.auth.uid
+          )
+          ||
+          // (B) Active Admin granting privileges to a DIFFERENT UID
+          (
+            adminUid != request.auth.uid
+            && isAdmin()
+          )
+        );
+
+      // Update: Active Admin may ONLY update ANOTHER admin's status/metadata (never self-tamper UID/role/active).
+      allow update: if isVerifiedEmail()
+        && isValidId(adminUid)
+        && adminUid != request.auth.uid
+        && isValidAdminRegistryEntry(incoming(), adminUid)
+        && incoming().uid == existing().uid
+        && incoming().role == existing().role
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'active', 'grantedByUid', 'updatedAt'])
+        && isAdmin();
+
+      // Delete: Active Admin may ONLY delete ANOTHER admin record; self-deletion (and deleting the last admin) is impossible.
+      allow delete: if isVerifiedEmail()
+        && isValidId(adminUid)
+        && adminUid != request.auth.uid
+        && isAdmin();
+    }
+
+    // 5. Immutable One-Time Bootstrap Lock (/adminSystem/bootstrap)
+    match /adminSystem/{docId} {
+      // Only Bootstrap owner (to inspect lock status) or active Admin may GET the bootstrap lock document.
+      allow get: if docId == 'bootstrap'
+        && isVerifiedEmail()
+        && (isBootstrapOwnerIdentity() || isAdmin());
+
+      allow list: if false;
+
+      // Created ONCE atomically alongside /admins/{bootstrapUid}; permanently sealed afterwards.
+      allow create: if docId == 'bootstrap'
+        && isBootstrapOwnerIdentity()
+        && isValidBootstrapLock(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isBootstrapNotInitialized()
+        && existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
+        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true;
+
+      // Immutable forever once created: cannot be modified or deleted by client.
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // 6. Protected Admin Configuration (/adminConfig/{configId}) — reserved for M1.2+
+    match /adminConfig/{configId} {
+      allow get: if isVerifiedEmail()
+        && isValidId(configId)
+        && isAdmin();
+
+      allow list: if false;
+
+      allow create: if isVerifiedEmail()
+        && isValidId(configId)
+        && isValidAdminSecurityConfig(incoming(), configId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+
+      allow update: if isVerifiedEmail()
+        && isValidId(configId)
+        && isValidAdminSecurityConfig(incoming(), configId)
+        && incoming().configKey == existing().configKey
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['description', 'updatedByUid', 'updatedAt'])
+        && isAdmin();
+
+      allow delete: if false;
+    }
+  }
+}

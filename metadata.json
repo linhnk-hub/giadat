@@ -1,0 +1,6 @@
+{
+  "name": "Tra Cứu Nhanh Giá Đất – Khánh Hòa",
+  "description": "Ứng dụng nghiệp vụ ngân hàng hỗ trợ tra cứu bảng giá đất Nhà nước (NQ 15/2025/NQ-HĐND tỉnh Khánh Hòa), dữ liệu khảo sát ECOVIS, ảnh thực địa GPS, khảo sát giá thị trường và tổng hợp báo cáo tham khảo thẩm định tài sản bảo đảm.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

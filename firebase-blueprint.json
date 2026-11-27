@@ -1,0 +1,144 @@
+{
+  "entities": {
+    "AdminRegistryEntry": {
+      "title": "AdminRegistryEntry",
+      "description": "Single source of truth for administrative authorization (D1). Keyed by Firebase Auth UID. Both Backend and Firestore Security Rules verify uid, role == 'admin', and active == true.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Authentication UID matching the document ID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified administrator email address."
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Optional administrator display name."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin"],
+          "description": "Fixed administrative role marker."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether administrative privileges are currently active."
+        },
+        "grantedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the administrator who granted this entry."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the entry was created (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest update."
+        }
+      },
+      "required": ["uid", "email", "role", "active", "grantedByUid", "createdAt", "updatedAt"]
+    },
+    "AdminBootstrapLock": {
+      "title": "AdminBootstrapLock",
+      "description": "Immutable one-time lock document created atomically with the first Bootstrap Admin document to permanently close the Bootstrap flow.",
+      "type": "object",
+      "properties": {
+        "initialized": {
+          "type": "boolean",
+          "description": "Always true once bootstrap initialization has completed."
+        },
+        "bootstrapAdminUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase UID of the initial bootstrap administrator."
+        },
+        "bootstrapAdminEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified email of the initial bootstrap administrator."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when bootstrap completed (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp matching createdAt (immutable)."
+        }
+      },
+      "required": ["initialized", "bootstrapAdminUid", "bootstrapAdminEmail", "createdAt", "updatedAt"]
+    },
+    "AdminSecurityConfig": {
+      "title": "AdminSecurityConfig",
+      "description": "Admin-only system configuration document reserved for upcoming milestones (M1.2+).",
+      "type": "object",
+      "properties": {
+        "configKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Identifier of the configuration document."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Human-readable description of this configuration record."
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the verified administrator who last modified this document."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated."
+        }
+      },
+      "required": ["configKey", "updatedByUid", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRegistryEntry" },
+      "description": "Single source of truth for Admin RBAC (D1). Strictly deny-by-default; non-admins can only GET their own UID path for verification and can never write or list."
+    },
+    "/adminSystem/bootstrap": {
+      "schema": { "$ref": "#/entities/AdminBootstrapLock" },
+      "description": "Immutable one-time lock document created atomically with the first Bootstrap Admin entry. Permanently seals Bootstrap after initialization."
+    },
+    "/adminConfig/{configId}": {
+      "schema": { "$ref": "#/entities/AdminSecurityConfig" },
+      "description": "Protected administrative configuration namespace reserved for M1.2+."
+    }
+  }
+}
