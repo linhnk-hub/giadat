@@ -1,0 +1,72 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "dataset_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "versionId", "order": "ASCENDING" },
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "isDemo", "order": "ASCENDING" },
+        { "fieldPath": "geohash5", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dataset_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "versionId", "order": "ASCENDING" },
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "isDemo", "order": "ASCENDING" },
+        { "fieldPath": "districtKey", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dataset_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "versionId", "order": "ASCENDING" },
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "isDemo", "order": "ASCENDING" },
+        { "fieldPath": "wardKey", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dataset_records",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "versionId", "order": "ASCENDING" },
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "isDemo", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "dataset_versions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "activation_history",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "datasetKind", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "pdf_documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

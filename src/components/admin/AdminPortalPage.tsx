@@ -3,69 +3,27 @@ import {
   ArrowLeft,
   CheckCircle2,
   Database,
-  Globe,
   LogOut,
   RefreshCw,
   ShieldCheck,
-  SlidersHorizontal,
-  History,
 } from 'lucide-react';
 import { useAdminAuth } from '../../context/AdminAuthContext';
 import { DataManagementModule } from '../modules/DataManagementModule';
 import { formatDateTimeVi } from '../../utils/formatters';
 import { navigateToPath } from '../../utils/navigation';
-
-const UPCOMING_ADMIN_MODULES = [
-  {
-    id: 'datasets-firestore',
-    milestone: 'M1.2',
-    status: 'active' as const,
-    title: 'Quản lý Bộ dữ liệu Excel / CSV / JSON & Lưu trữ máy chủ',
-    description:
-      'Lưu trữ bền vững dữ liệu Giá Nhà nước, ECOVIS, Thị trường và Quy định K theo từng phiên bản trên máy chủ, hỗ trợ tọa độ không gian GPS (tùy chọn), xem trước kiểm lỗi, xuất JSON và khôi phục phiên bản.',
-    icon: Database,
-  },
-  {
-    id: 'sources-registry',
-    milestone: 'M2 / M5',
-    status: 'upcoming' as const,
-    title: 'Danh mục nguồn Website BĐS & Facebook Group',
-    description:
-      'Quản lý nguồn dữ liệu tham khảo, phân loại nguồn công khai / hạn chế / nhập tay, theo dõi trạng thái cập nhật và lỗi kiểm tra.',
-    icon: Globe,
-  },
-  {
-    id: 'geo-k-config',
-    milestone: 'M3 / M4',
-    status: 'upcoming' as const,
-    title: 'Cấu hình bán kính lân cận & quy tắc Hệ số K',
-    description:
-      'Thiết lập bán kính tìm kiếm giá thị trường lân cận và các tiêu chí có căn cứ phục vụ đề xuất hệ số K tự động.',
-    icon: SlidersHorizontal,
-  },
-  {
-    id: 'audit-backup',
-    milestone: 'M5',
-    status: 'upcoming' as const,
-    title: 'Nhật ký thao tác Admin & Sao lưu dữ liệu',
-    description:
-      'Ghi nhận lịch sử thay đổi phiên bản, kiểm tra trạng thái hệ thống và sao lưu/khôi phục toàn bộ kho dữ liệu.',
-    icon: History,
-  },
-];
+import { firestoreDatabaseId } from '../../firebase';
 
 function getAuthMethodLabel(method: string): string {
   switch (method) {
-    case 'single_fixed_admin_email':
-      return 'Email Quản trị cố định (Xác minh máy chủ)';
+    case 'firebase_auth_firestore_rules_a1':
+      return 'Single Fixed Admin Email (Firebase Auth + Firestore Rules)';
     default:
-      return 'Email Quản trị cố định (Xác minh máy chủ)';
+      return 'Single Fixed Admin Email (Firebase Auth + Firestore Rules)';
   }
 }
 
 export const AdminPortalPage: React.FC = () => {
   const { adminSession, signOutAdmin, reverifySession, isBusy } = useAdminAuth();
-  const [activeTab, setActiveTab] = useState<'datasets' | 'overview'>('datasets');
   const [rechecking, setRechecking] = useState(false);
 
   const handleRecheck = async () => {
@@ -92,7 +50,7 @@ export const AdminPortalPage: React.FC = () => {
                 TRA CỨU NHANH GIÁ ĐẤT – KHÁNH HÒA
               </div>
               <div className="text-xs text-[#6B7280]">
-                Khu vực Quản trị (Admin Portal) · Single Fixed Admin Email
+                Khu vực Quản trị (Admin Portal) · Cloud Firestore ({firestoreDatabaseId})
               </div>
             </div>
           </div>
@@ -120,24 +78,24 @@ export const AdminPortalPage: React.FC = () => {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8 space-y-6">
-        {/* Welcome & Verified Authentication Status */}
+        {/* Verified Admin Session Summary */}
         <section className="banking-card p-5 sm:p-6">
-          <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <div className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-[#0B5D3F]">
                 <CheckCircle2 className="h-4 w-4" />
-                Phiên Quản trị đã được máy chủ xác minh
+                Phiên Quản trị đã xác minh với Firebase Auth & Cloud Firestore Rules
               </div>
               <h1 className="mt-1.5 banking-page-title">
-                Chào mừng Quản trị viên
+                Quản trị Kho dữ liệu Giá đất Khánh Hòa
               </h1>
               <p className="mt-1.5 text-sm leading-relaxed text-[#4B5563]">
                 Đang đăng nhập với tài khoản{' '}
                 <span className="font-mono font-medium text-[#1F2429]">
                   {adminSession?.email || adminSession?.uid}
                 </span>
-                . Mọi thao tác nhạy cảm và các đường dẫn{' '}
-                <code className="font-mono text-[13px] text-[#1F2429]">/api/admin/*</code> đều được bảo vệ bằng xác minh Firebase ID token ở máy chủ.
+                . Mọi thao tác nạp phiên bản, kích hoạt, khôi phục (rollback) và cập nhật danh mục PDF được thực thi trực tiếp trên Cloud Firestore database{' '}
+                <code className="font-mono text-[13px] text-[#1F2429]">{firestoreDatabaseId}</code>.
               </p>
             </div>
 
@@ -154,19 +112,20 @@ export const AdminPortalPage: React.FC = () => {
 
           <div className="mt-5 grid grid-cols-1 gap-4 border-t border-[#E2E5E9] pt-5 sm:grid-cols-3 text-[13px]">
             <div>
-              <div className="text-[#6B7280]">Cơ chế phân quyền máy chủ</div>
+              <div className="text-[#6B7280]">Cơ chế bảo vệ</div>
               <div className="mt-1 font-semibold text-[#1F2429]">
                 {getAuthMethodLabel(adminSession?.authMethod || '')}
               </div>
             </div>
             <div>
-              <div className="text-[#6B7280]">Firebase UID (rút gọn)</div>
-              <div className="mt-1 font-mono font-medium text-[#1F2429]">
-                {adminSession?.uid ? `${adminSession.uid.slice(0, 10)}…` : '—'}
+              <div className="text-[#6B7280]">Cloud Firestore Database ID</div>
+              <div className="mt-1 inline-flex items-center gap-1.5 font-mono font-medium text-[#1F2429]">
+                <Database className="h-3.5 w-3.5 text-[#0B5D3F]" />
+                {adminSession?.databaseId || firestoreDatabaseId}
               </div>
             </div>
             <div>
-              <div className="text-[#6B7280]">Thời điểm xác minh máy chủ</div>
+              <div className="text-[#6B7280]">Thời điểm xác minh</div>
               <div className="mt-1 font-mono font-medium text-[#1F2429]">
                 {formatDateTimeVi(adminSession?.serverVerifiedAt)}
               </div>
@@ -174,99 +133,10 @@ export const AdminPortalPage: React.FC = () => {
           </div>
         </section>
 
-        {/* Section Switcher: M1.2 Datasets vs Roadmap Overview */}
-        <div className="flex items-center gap-2 border-b border-[#E2E5E9] pb-px">
-          <button
-            type="button"
-            onClick={() => setActiveTab('datasets')}
-            className={`px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors cursor-pointer ${
-              activeTab === 'datasets'
-                ? 'border-[#9D1D26] text-[#9D1D26]'
-                : 'border-transparent text-[#4B5563] hover:text-[#1F2429]'
-            }`}
-          >
-            Quản lý Bộ dữ liệu nguồn (M1.2)
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('overview')}
-            className={`px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors cursor-pointer ${
-              activeTab === 'overview'
-                ? 'border-[#9D1D26] text-[#9D1D26]'
-                : 'border-transparent text-[#4B5563] hover:text-[#1F2429]'
-            }`}
-          >
-            Tổng quan lộ trình Admin Portal
-          </button>
-        </div>
-
-        {activeTab === 'overview' ? (
-          <section className="space-y-4">
-            <div>
-              <h2 className="banking-section-title">
-                Các phân hệ quản trị theo lộ trình triển khai
-              </h2>
-              <p className="mt-1 text-sm text-[#4B5563]">
-                M1.1 (Xác thực Admin) và M1.2 (Quản lý bộ dữ liệu máy chủ CSV/Excel/JSON, tọa độ không gian và lịch sử phiên bản) đã hoạt động. Các phân hệ M2–M5 sẽ được kích hoạt ở các giai đoạn tiếp theo.
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              {UPCOMING_ADMIN_MODULES.map((mod) => {
-                const Icon = mod.icon;
-                const isActiveMod = mod.status === 'active';
-                return (
-                  <div
-                    key={mod.id}
-                    className="banking-card p-5 flex flex-col justify-between"
-                  >
-                    <div>
-                      <div className="flex items-center justify-between gap-2">
-                        <div
-                          className={`flex h-9 w-9 items-center justify-center rounded-md border ${
-                            isActiveMod
-                              ? 'bg-[#ECF7F2] border-[#B8DEC9] text-[#0B5D3F]'
-                              : 'bg-[#F6F7F8] border-[#E2E5E9] text-[#4B5563]'
-                          }`}
-                        >
-                          <Icon className="h-4 w-4" />
-                        </div>
-                        <span
-                          className={`font-mono text-xs font-semibold ${
-                            isActiveMod ? 'text-[#0B5D3F]' : 'text-[#6B7280]'
-                          }`}
-                        >
-                          {isActiveMod ? `Đang hoạt động (${mod.milestone})` : `Dự kiến ${mod.milestone}`}
-                        </span>
-                      </div>
-                      <h3 className="mt-3 text-[15px] font-semibold text-[#1F2429]">{mod.title}</h3>
-                      <p className="mt-1.5 text-[13px] leading-relaxed text-[#4B5563]">
-                        {mod.description}
-                      </p>
-                    </div>
-                    <div className="mt-4 pt-3 border-t border-[#E2E5E9] flex items-center justify-between text-[13px]">
-                      {isActiveMod ? (
-                        <button
-                          type="button"
-                          onClick={() => setActiveTab('datasets')}
-                          className="font-semibold text-[#9D1D26] hover:text-[#7F151D] hover:underline cursor-pointer"
-                        >
-                          Mở phân hệ Quản lý Bộ dữ liệu →
-                        </button>
-                      ) : (
-                        <span className="text-[#6B7280]">Chưa triển khai ở giai đoạn hiện tại</span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </section>
-        ) : (
-          <section className="space-y-3">
-            <DataManagementModule />
-          </section>
-        )}
+        {/* Direct Cloud Firestore Dataset Management */}
+        <section className="space-y-3">
+          <DataManagementModule />
+        </section>
       </main>
     </div>
   );

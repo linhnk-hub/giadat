@@ -3,7 +3,7 @@
   "appId": "1:625387730090:web:0a2ed00c62005b2b338cd3",
   "apiKey": "AIzaSyC4Umx5mKbnnIU15g0j_jOnE648fybdLMY",
   "authDomain": "giadat.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-giadat-39a309ec-a088-4967-b3ab-306f81c03d64",
+  "firestoreDatabaseId": "giadat",
   "storageBucket": "giadat.firebasestorage.app",
   "messagingSenderId": "625387730090",
   "measurementId": "",

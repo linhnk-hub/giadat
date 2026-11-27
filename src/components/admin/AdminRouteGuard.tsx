@@ -21,8 +21,8 @@ export const AdminRouteGuard: React.FC = () => {
               <Loader2 className="h-4 w-4 animate-spin text-[#9D1D26]" />
               <span>
                 {status === 'verifying'
-                  ? 'Đang xác minh quyền Quản trị với máy chủ...'
-                  : 'Đang kiểm tra phiên xác thực...'}
+                  ? 'Đang xác minh quyền Quản trị với Cloud Firestore...'
+                  : 'Đang kiểm tra phiên xác thực Firebase...'}
               </span>
             </div>
           </div>

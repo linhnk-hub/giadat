@@ -1,25 +1,35 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  AlertTriangle,
+  AlertCircle,
   CheckCircle2,
   Database,
   Download,
-  ExternalLink,
-  FileJson,
   FileSpreadsheet,
   FileText,
   History,
+  Loader2,
   MapPin,
   RefreshCw,
-  ShieldCheck,
+  RotateCcw,
   Trash2,
   Upload,
 } from 'lucide-react';
-import { useAdminAuth } from '../../context/AdminAuthContext';
-import { useAppData, type ServerActiveDatasetsSnapshot } from '../../context/AppDataContext';
+import { useAppData } from '../../context/AppDataContext';
+import { firestoreDatabaseId } from '../../firebase';
 import {
+  activateOrRollbackDatasetVersion,
+  ALL_DATASET_KINDS,
+  createPdfReferenceDocument,
+  deletePdfReferenceDocument,
+  exportDatasetVersionBackupJson,
+  fetchAdminOverview,
+  importAndStageDatasetVersion,
+  type AdminOverviewSnapshot,
+  type FirestoreDatasetVersionSummary,
+  type ImportProgressUpdate,
+} from '../../services/firestoreDatasetStore';
+import type {
   DatasetKind,
-  DatasetVersionMetadata,
   EcovisRecord,
   ImportPreviewResult,
   KFactorRuleRecord,
@@ -27,934 +37,923 @@ import {
   PdfReferenceDocument,
   StateLandPriceRecord,
 } from '../../types/valuation';
-import { buildApiUrl } from '../../utils/apiClient';
-import { formatBytes, formatDateTimeVi } from '../../utils/formatters';
+import { formatDateTimeVi } from '../../utils/formatters';
 import {
   downloadExcelTemplate,
   downloadJsonPayload,
   downloadJsonTemplate,
+  getDatasetTemplateSpec,
   parseSpreadsheetFileWithMeta,
   validateAndPreviewImport,
 } from '../../utils/importExport';
 
-const DATASET_LABELS: Record<DatasetKind, string> = {
-  state_price: 'Bảng giá đất Nhà nước (NQ 15/2025/NQ-HĐND Khánh Hòa)',
-  ecovis: 'Dữ liệu khảo sát giá đất ECOVIS',
-  k_factor_rules: 'Danh mục quy định Hệ số K',
-  market_survey: 'Danh sách khảo sát giá thị trường',
-};
+const DATASET_KIND_OPTIONS: Array<{
+  kind: DatasetKind;
+  label: string;
+  shortLabel: string;
+  defaultSourceDoc: string;
+}> = [
+  {
+    kind: 'state_price',
+    label: 'Bảng giá đất Nhà nước (Khánh Hòa)',
+    shortLabel: 'Giá Nhà nước',
+    defaultSourceDoc: 'Nghị quyết 15/2025/NQ-HĐND tỉnh Khánh Hòa',
+  },
+  {
+    kind: 'ecovis',
+    label: 'Dữ liệu khảo sát ECOVIS',
+    shortLabel: 'ECOVIS',
+    defaultSourceDoc: 'Báo cáo khảo sát giá đất ECOVIS (187/2025/39/BC-E.AFA)',
+  },
+  {
+    kind: 'market_survey',
+    label: 'Khảo sát rao bán thị trường',
+    shortLabel: 'Thị trường',
+    defaultSourceDoc: 'Khảo sát tin rao bán tham khảo (không phải giá giao dịch)',
+  },
+  {
+    kind: 'k_factor_rules',
+    label: 'Bảng quy định Hệ số K',
+    shortLabel: 'Hệ số K',
+    defaultSourceDoc: 'Quy định hệ số điều chỉnh giá đất',
+  },
+];
 
-interface AdminDatasetsOverview {
-  storageBackend: 'server_json_file';
-  updatedAt: string;
-  counts: {
-    statePrice: number;
-    ecovis: number;
-    kFactorRules: number;
-    marketSurvey: number;
-    totalVersions: number;
-    pdfDocuments: number;
-  };
-  activeVersionIds: Record<DatasetKind, string | null>;
-  versions: DatasetVersionMetadata[];
-  pdfDocuments: Omit<PdfReferenceDocument, 'sessionObjectUrl'>[];
+function getKindLabel(kind: DatasetKind): string {
+  return DATASET_KIND_OPTIONS.find((d) => d.kind === kind)?.shortLabel ?? kind;
 }
 
 export const DataManagementModule: React.FC = () => {
-  const { status: adminStatus, reverifySession, getAdminAuthHeaders } = useAdminAuth();
-  const {
-    isDemoMode,
-    setIsDemoMode,
-    allVersionHistory: localVersionHistory,
-    commitDatasetVersion,
-    activateDatasetVersion,
-    applyServerActiveSnapshot,
-    localVersionsCount,
-    exportLocalDatasetsForMigration,
-    pdfDocuments,
-    addPdfDocument,
-    removePdfDocument,
-  } = useAppData();
+  const { refreshServerDatasets } = useAppData();
 
-  const [authActionError, setAuthActionError] = useState<string | null>(null);
-  const [serverOverview, setServerOverview] = useState<AdminDatasetsOverview | null>(null);
-  const [loadingOverview, setLoadingOverview] = useState(false);
-  const [actionBusy, setActionBusy] = useState(false);
-  const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
+  // Firestore Admin Overview State
+  const [overview, setOverview] = useState<AdminOverviewSnapshot | null>(null);
+  const [loadingOverview, setLoadingOverview] = useState(true);
+  const [overviewError, setOverviewError] = useState<string | null>(null);
 
-  // Excel/CSV/JSON import state
+  // Import Form State
   const [selectedKind, setSelectedKind] = useState<DatasetKind>('state_price');
-  const [sourceDocumentName, setSourceDocumentName] = useState('');
   const [versionLabel, setVersionLabel] = useState('');
-  const [effectiveDate, setEffectiveDate] = useState('');
-  const [importNotes, setImportNotes] = useState('');
-  const [parseError, setParseError] = useState<string | null>(null);
-  const [commitSuccess, setCommitSuccess] = useState<string | null>(null);
+  const [sourceDocumentName, setSourceDocumentName] = useState(
+    DATASET_KIND_OPTIONS[0].defaultSourceDoc
+  );
+  const [effectiveDate, setEffectiveDate] = useState(new Date().toISOString().slice(0, 10));
+  const [notes, setNotes] = useState('');
+  const [activateImmediately, setActivateImmediately] = useState(true);
+
+  const [parsingFile, setParsingFile] = useState(false);
   const [preview, setPreview] = useState<
     ImportPreviewResult<
       StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord
     > | null
   >(null);
-  const spreadsheetInputRef = useRef<HTMLInputElement | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
 
-  // PDF upload state
+  // Staging Upload / Progress State
+  const [committing, setCommitting] = useState(false);
+  const [progress, setProgress] = useState<ImportProgressUpdate | null>(null);
+  const [actionBanner, setActionBanner] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+
+  // Version action busy tracking
+  const [busyVersionId, setBusyVersionId] = useState<string | null>(null);
+
+  // PDF Archive Form State
   const [pdfTitle, setPdfTitle] = useState('');
+  const [pdfFileName, setPdfFileName] = useState('');
   const [pdfCategory, setPdfCategory] =
     useState<PdfReferenceDocument['documentCategory']>('bang_gia_nha_nuoc');
-  const [pdfPageCount, setPdfPageCount] = useState('');
   const [pdfEffectiveDate, setPdfEffectiveDate] = useState('');
+  const [pdfPageCount, setPdfPageCount] = useState('');
   const [pdfAppendixNote, setPdfAppendixNote] = useState('');
-  const [pdfError, setPdfError] = useState<string | null>(null);
-  const pdfInputRef = useRef<HTMLInputElement | null>(null);
+  const [pdfFileSizeBytes, setPdfFileSizeBytes] = useState(0);
+  const [savingPdf, setSavingPdf] = useState(false);
 
-  const loadServerOverview = useCallback(async () => {
-    if (adminStatus !== 'authorized') return;
+  const loadOverview = useCallback(async () => {
     setLoadingOverview(true);
+    setOverviewError(null);
     try {
-      const headers = await getAdminAuthHeaders(false);
-      const res = await fetch(buildApiUrl('/api/admin/datasets'), {
-        method: 'GET',
-        headers,
-        cache: 'no-store',
-      });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
-        setAuthActionError(body.error || 'Không thể tải danh sách bộ dữ liệu trên máy chủ.');
-        return;
-      }
-      const data = (await res.json()) as AdminDatasetsOverview;
-      setServerOverview(data);
-    } catch {
-      setAuthActionError('Không thể kết nối máy chủ để tải danh sách phiên bản bộ dữ liệu.');
+      const data = await fetchAdminOverview();
+      setOverview(data);
+    } catch (err) {
+      setOverviewError(
+        err instanceof Error
+          ? err.message
+          : 'Không thể tải danh sách phiên bản từ Cloud Firestore.'
+      );
     } finally {
       setLoadingOverview(false);
     }
-  }, [adminStatus, getAdminAuthHeaders]);
+  }, []);
 
   useEffect(() => {
-    if (adminStatus === 'authorized') {
-      void loadServerOverview();
-    }
-  }, [adminStatus, loadServerOverview]);
+    void loadOverview();
+  }, [loadOverview]);
 
-  const handleSpreadsheetSelected = async (file: File | null) => {
-    if (!file) return;
-    setParseError(null);
-    setCommitSuccess(null);
+  const handleKindChange = (kind: DatasetKind) => {
+    setSelectedKind(kind);
+    const cfg = DATASET_KIND_OPTIONS.find((d) => d.kind === kind);
+    if (cfg) setSourceDocumentName(cfg.defaultSourceDoc);
     setPreview(null);
+    setParseError(null);
+    setProgress(null);
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    setParsingFile(true);
+    setParseError(null);
+    setPreview(null);
+    setProgress(null);
+    setActionBanner(null);
 
     try {
-      const parsed = await parseSpreadsheetFileWithMeta(file, selectedKind);
-      const tempVersionId = `v-${Date.now()}`;
-      const result = validateAndPreviewImport(selectedKind, file.name, parsed.rows, {
-        sourceDocumentName: sourceDocumentName.trim(),
-        effectiveDate: effectiveDate.trim(),
+      const tempVersionId = `${selectedKind}_${Date.now()}`;
+      const tabular = await parseSpreadsheetFileWithMeta(file, selectedKind);
+      const parsed = validateAndPreviewImport(selectedKind, file.name, tabular.rows, {
+        sourceDocumentName,
+        effectiveDate,
         versionId: tempVersionId,
-        selectedSheetName: parsed.selectedSheetName,
+        selectedSheetName: tabular.selectedSheetName,
       });
-      setPreview(result);
+
+      setPreview(parsed);
+      if (!versionLabel.trim()) {
+        setVersionLabel(`${getKindLabel(selectedKind)} · ${file.name.replace(/\.[^.]+$/, '')}`);
+      }
     } catch (err) {
       setParseError(
-        err instanceof Error ? err.message : 'Không đọc được tệp Excel/CSV/JSON.'
+        err instanceof Error
+          ? err.message
+          : 'Không thể đọc tệp dữ liệu. Vui lòng kiểm tra định dạng Excel (.xlsx), CSV hoặc JSON.'
       );
     } finally {
-      if (spreadsheetInputRef.current) {
-        spreadsheetInputRef.current.value = '';
-      }
+      setParsingFile(false);
     }
   };
 
-  const ensureVerifiedAdmin = async (): Promise<boolean> => {
-    setAuthActionError(null);
-    if (adminStatus !== 'authorized') {
-      setAuthActionError('Phiên quản trị chưa được xác minh. Thao tác bị từ chối.');
-      return false;
-    }
-    const stillAuthorized = await reverifySession(false);
-    if (!stillAuthorized) {
-      setAuthActionError('Máy chủ từ chối quyền Quản trị viên. Vui lòng đăng nhập lại.');
-      return false;
-    }
-    return true;
-  };
+  const handleCommitToFirestore = async () => {
+    if (!preview || !preview.canCommit || preview.validRows.length === 0) return;
 
-  const handleCommitImport = async () => {
-    if (!preview || !preview.canCommit) return;
-    if (!(await ensureVerifiedAdmin())) return;
-
-    setActionBusy(true);
-    setParseError(null);
-    setCommitSuccess(null);
+    setCommitting(true);
+    setActionBanner(null);
+    setProgress(null);
 
     try {
-      const nowIso = new Date().toISOString();
-      const versionId = `ver-${Date.now()}`;
-      const label =
-        versionLabel.trim() ||
-        `Phiên bản ${new Date().toLocaleDateString('vi-VN')} (${preview.validRows.length} dòng)`;
-
-      const metaPayload = {
-        versionId,
-        datasetKind: preview.datasetKind,
-        versionLabel: label,
-        sourceDocumentName:
-          sourceDocumentName.trim() || DATASET_LABELS[preview.datasetKind],
-        sourceFileName: preview.fileName,
-        effectiveDate: effectiveDate.trim() || 'Chưa ghi ngày hiệu lực',
-        importedAt: nowIso,
-        rowCount: preview.validRows.length,
-        spatialRecordsCount: preview.validSpatialCount ?? 0,
-        notes: importNotes.trim(),
-      };
-
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(
-        buildApiUrl(`/api/admin/datasets/${preview.datasetKind}/versions`),
+      const result = await importAndStageDatasetVersion(
         {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          meta: metaPayload,
+          datasetKind: selectedKind,
+          versionLabel:
+            versionLabel.trim() || `${getKindLabel(selectedKind)} (${effectiveDate})`,
+          sourceDocumentName:
+            sourceDocumentName.trim() || getKindLabel(selectedKind),
+          sourceFileName: preview.fileName,
+          effectiveDate: effectiveDate.trim() || new Date().toISOString().slice(0, 10),
+          notes: notes.trim(),
           records: preview.validRows,
-          activate: true,
-        }),
-        cache: 'no-store',
+          activate: activateImmediately,
+        },
+        (update) => setProgress(update)
+      );
+
+      setActionBanner({
+        type: 'success',
+        message: result.activated
+          ? `Đã nạp và kích hoạt nguyên tử phiên bản ${result.versionId} (${result.rowCount.toLocaleString('vi-VN')} bản ghi, ${result.spatialRecordsCount} có GPS, SHA-256: ${result.payloadChecksum.slice(0, 12)}…).`
+          : `Đã lưu phiên bản ${result.versionId} (${result.rowCount.toLocaleString('vi-VN')} bản ghi, chưa kích hoạt).`,
       });
-
-      const body = (await response.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        version?: DatasetVersionMetadata;
-        activeSnapshot?: ServerActiveDatasetsSnapshot;
-      };
-
-      if (!response.ok || !body.ok) {
-        setParseError(
-          body.error || 'Máy chủ từ chối lưu phiên bản dữ liệu mới. Dữ liệu gốc được giữ nguyên.'
-        );
-        return;
-      }
-
-      if (body.activeSnapshot) {
-        applyServerActiveSnapshot(body.activeSnapshot);
-      }
-
-      // Mirror non-destructively into local backup state as well
-      commitDatasetVersion(
-        preview.datasetKind,
-        metaPayload,
-        preview.validRows as StateLandPriceRecord[]
-      );
-
-      await loadServerOverview();
-
-      const spatialNote =
-        (preview.validSpatialCount ?? 0) > 0
-          ? ` (${preview.validSpatialCount} dòng có tọa độ GPS hợp lệ)`
-          : '';
-      setCommitSuccess(
-        `Đã lưu bền vững lên máy chủ phiên bản "${label}" (${preview.validRows.length} dòng hợp lệ${spatialNote}) cho ${DATASET_LABELS[preview.datasetKind]}. Các phiên bản trước vẫn được giữ nguyên vẹn.`
-      );
       setPreview(null);
       setVersionLabel('');
-      setImportNotes('');
-    } catch {
-      setParseError('Không thể kết nối máy chủ để lưu phiên bản dữ liệu mới. Dữ liệu gốc được giữ nguyên.');
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const handleActivateVersion = async (kind: DatasetKind, versionId: string) => {
-    if (!(await ensureVerifiedAdmin())) return;
-
-    setActionBusy(true);
-    setAuthActionError(null);
-    setCommitSuccess(null);
-    try {
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(
-        buildApiUrl(
-          `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/activate`
-        ),
-        {
-          method: 'POST',
-          headers,
-          cache: 'no-store',
-        }
-      );
-      const body = (await response.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        version?: DatasetVersionMetadata;
-        activeSnapshot?: ServerActiveDatasetsSnapshot;
-      };
-      if (!response.ok || !body.ok) {
-        setAuthActionError(body.error || 'Không thể khôi phục phiên bản đã chọn.');
-        return;
-      }
-      if (body.activeSnapshot) {
-        applyServerActiveSnapshot(body.activeSnapshot);
-      }
-      activateDatasetVersion(kind, versionId);
-      await loadServerOverview();
-      setCommitSuccess(
-        `Đã kích hoạt lại phiên bản "${body.version?.versionLabel || versionId}" cho ${DATASET_LABELS[kind]}.`
-      );
-    } catch {
-      setAuthActionError('Không thể kết nối máy chủ khi khôi phục phiên bản.');
-    } finally {
-      setActionBusy(false);
-    }
-  };
-
-  const handleExportVersionJson = async (kind: DatasetKind, versionId: string) => {
-    if (!(await ensureVerifiedAdmin())) return;
-    setAuthActionError(null);
-    try {
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(
-        buildApiUrl(
-          `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/export`
-        ),
-        {
-          method: 'GET',
-          headers,
-          cache: 'no-store',
-        }
-      );
-      if (!response.ok) {
-        const body = (await response.json().catch(() => ({}))) as { error?: string };
-        setAuthActionError(body.error || 'Không thể xuất tệp JSON phiên bản.');
-        return;
-      }
-      const payload = await response.json();
-      downloadJsonPayload(`${kind}_${versionId}.json`, payload);
-    } catch {
-      setAuthActionError('Không thể kết nối máy chủ để xuất tệp JSON.');
-    }
-  };
-
-  const handleMigrateLocalToServer = async () => {
-    if (!(await ensureVerifiedAdmin())) return;
-    setActionBusy(true);
-    setMigrationMessage(null);
-    setAuthActionError(null);
-
-    try {
-      const localPayload = exportLocalDatasetsForMigration();
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(buildApiUrl('/api/admin/datasets/migrate-local'), {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(localPayload),
-        cache: 'no-store',
+      setNotes('');
+      await Promise.all([loadOverview(), refreshServerDatasets()]);
+    } catch (err) {
+      setActionBanner({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Nạp dữ liệu vào Cloud Firestore thất bại.',
       });
-      const body = (await response.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        importedVersions?: number;
-        skippedVersions?: number;
-        importedPdfs?: number;
-        activeSnapshot?: ServerActiveDatasetsSnapshot;
-      };
-      if (!response.ok || !body.ok) {
-        setAuthActionError(body.error || 'Không thể đồng bộ dữ liệu cục bộ lên máy chủ.');
-        return;
-      }
-      if (body.activeSnapshot) {
-        applyServerActiveSnapshot(body.activeSnapshot);
-      }
-      await loadServerOverview();
-      setMigrationMessage(
-        `Đồng bộ hoàn tất (không xóa dữ liệu cũ): đã chuyển ${body.importedVersions ?? 0} phiên bản mới, bỏ qua ${body.skippedVersions ?? 0} phiên bản đã tồn tại và đồng bộ ${body.importedPdfs ?? 0} hồ sơ PDF.`
-      );
-    } catch {
-      setAuthActionError('Không thể kết nối máy chủ khi đồng bộ dữ liệu cục bộ.');
     } finally {
-      setActionBusy(false);
+      setCommitting(false);
     }
   };
 
-  const handlePdfSelected = async (file: File | null) => {
+  const handleActivateOrRollback = async (
+    ver: FirestoreDatasetVersionSummary,
+    action: 'activate' | 'rollback'
+  ) => {
+    setBusyVersionId(ver.versionId);
+    setActionBanner(null);
+    try {
+      const res = await activateOrRollbackDatasetVersion({
+        datasetKind: ver.datasetKind,
+        targetVersionId: ver.versionId,
+        action,
+      });
+      setActionBanner({
+        type: 'success',
+        message:
+          action === 'rollback'
+            ? `Đã khôi phục phiên bản ${res.toVersionId} cho nhóm ${getKindLabel(ver.datasetKind)} (mã kiểm toán ${res.eventId}).`
+            : `Đã kích hoạt phiên bản ${res.toVersionId} cho nhóm ${getKindLabel(ver.datasetKind)}.`,
+      });
+      await Promise.all([loadOverview(), refreshServerDatasets()]);
+    } catch (err) {
+      setActionBanner({
+        type: 'error',
+        message:
+          err instanceof Error ? err.message : 'Chuyển đổi phiên bản dữ liệu thất bại.',
+      });
+    } finally {
+      setBusyVersionId(null);
+    }
+  };
+
+  const handleExportJsonBackup = async (ver: FirestoreDatasetVersionSummary) => {
+    setBusyVersionId(ver.versionId);
+    setActionBanner(null);
+    try {
+      const backup = await exportDatasetVersionBackupJson(ver.datasetKind, ver.versionId);
+      downloadJsonPayload(`backup_${ver.datasetKind}_${ver.versionId}.json`, backup);
+      setActionBanner({
+        type: 'success',
+        message: `Đã xuất bản sao lưu JSON (${backup.records.length.toLocaleString('vi-VN')} bản ghi) cho phiên bản ${ver.versionId}.`,
+      });
+    } catch (err) {
+      setActionBanner({
+        type: 'error',
+        message:
+          err instanceof Error ? err.message : 'Xuất bản sao lưu JSON thất bại.',
+      });
+    } finally {
+      setBusyVersionId(null);
+    }
+  };
+
+  const handlePdfFilePick = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
     if (!file) return;
-    setPdfError(null);
-    if (!(await ensureVerifiedAdmin())) return;
-    if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-      setPdfError('Chỉ chấp nhận tệp định dạng PDF (.pdf).');
-      return;
-    }
-
-    const sessionObjectUrl = URL.createObjectURL(file);
-    const pdfPayload: Omit<PdfReferenceDocument, 'sessionObjectUrl'> = {
-      id: `pdf-${Date.now()}`,
-      fileName: file.name,
-      documentTitle: pdfTitle.trim() || file.name.replace(/\.pdf$/i, ''),
-      documentCategory: pdfCategory,
-      pageCount: pdfPageCount.trim() ? Number(pdfPageCount) : null,
-      effectiveDate: pdfEffectiveDate.trim(),
-      appendixNote: pdfAppendixNote.trim(),
-      fileSizeBytes: file.size,
-      uploadedAt: new Date().toISOString(),
-    };
-
-    try {
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(buildApiUrl('/api/admin/datasets/pdfs'), {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(pdfPayload),
-        cache: 'no-store',
-      });
-      const body = (await response.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        activeSnapshot?: ServerActiveDatasetsSnapshot;
-      };
-      if (!response.ok || !body.ok) {
-        setPdfError(body.error || 'Không thể lưu thông tin tài liệu PDF lên máy chủ.');
-        return;
-      }
-      if (body.activeSnapshot) {
-        applyServerActiveSnapshot(body.activeSnapshot);
-      }
-      addPdfDocument({ ...pdfPayload, sessionObjectUrl });
-      await loadServerOverview();
-    } catch {
-      setPdfError('Không thể kết nối máy chủ khi lưu hồ sơ PDF.');
-      return;
-    }
-
-    setPdfTitle('');
-    setPdfPageCount('');
-    setPdfEffectiveDate('');
-    setPdfAppendixNote('');
-    if (pdfInputRef.current) {
-      pdfInputRef.current.value = '';
+    setPdfFileName(file.name);
+    setPdfFileSizeBytes(file.size);
+    if (!pdfTitle.trim()) {
+      setPdfTitle(file.name.replace(/\.pdf$/i, ''));
     }
   };
 
-  const handleRemovePdf = async (id: string) => {
-    if (!(await ensureVerifiedAdmin())) return;
+  const handleSavePdfMetadata = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pdfTitle.trim() || !pdfFileName.trim()) return;
+    setSavingPdf(true);
+    setActionBanner(null);
     try {
-      const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(
-        buildApiUrl(`/api/admin/datasets/pdfs/${encodeURIComponent(id)}`),
-        {
-        method: 'DELETE',
-        headers,
-        cache: 'no-store',
+      const parsedPages = pdfPageCount.trim() ? Number(pdfPageCount.trim()) : null;
+      await createPdfReferenceDocument({
+        fileName: pdfFileName.trim(),
+        documentTitle: pdfTitle.trim(),
+        documentCategory: pdfCategory,
+        pageCount:
+          parsedPages !== null && Number.isInteger(parsedPages) && parsedPages > 0
+            ? parsedPages
+            : null,
+        effectiveDate: pdfEffectiveDate.trim(),
+        appendixNote: pdfAppendixNote.trim(),
+        fileSizeBytes: pdfFileSizeBytes,
       });
-      if (response.ok) {
-        const body = (await response.json().catch(() => ({}))) as {
-          activeSnapshot?: ServerActiveDatasetsSnapshot;
-        };
-        if (body.activeSnapshot) {
-          applyServerActiveSnapshot(body.activeSnapshot);
-        }
-        await loadServerOverview();
-      }
-    } catch {
-      // ignore network error and keep local state consistent if only local
+      setPdfTitle('');
+      setPdfFileName('');
+      setPdfEffectiveDate('');
+      setPdfPageCount('');
+      setPdfAppendixNote('');
+      setPdfFileSizeBytes(0);
+      setActionBanner({
+        type: 'success',
+        message: 'Đã lưu thông tin tài liệu PDF nguồn vào Cloud Firestore.',
+      });
+      await Promise.all([loadOverview(), refreshServerDatasets()]);
+    } catch (err) {
+      setActionBanner({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Lưu tài liệu PDF thất bại.',
+      });
+    } finally {
+      setSavingPdf(false);
     }
-    removePdfDocument(id);
   };
 
-  // Defense-in-depth: never render admin data management UI unless server-verified Admin
-  if (adminStatus !== 'authorized') {
-    return (
-      <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] p-6 text-sm text-[#641016]">
-        Truy cập bị từ chối (Access Denied). Khu vực quản lý dữ liệu chỉ dành cho Quản trị viên đã được xác minh tại máy chủ.
-      </div>
-    );
-  }
+  const handleDeletePdf = async (docId: string) => {
+    setActionBanner(null);
+    try {
+      await deletePdfReferenceDocument(docId);
+      setActionBanner({
+        type: 'success',
+        message: `Đã xóa mục tài liệu PDF (${docId}) khỏi danh mục.`,
+      });
+      await Promise.all([loadOverview(), refreshServerDatasets()]);
+    } catch (err) {
+      setActionBanner({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Xóa tài liệu PDF thất bại.',
+      });
+    }
+  };
 
-  const displayedVersions = serverOverview?.versions ?? localVersionHistory;
-  const serverVersionIds = new Set((serverOverview?.versions ?? []).map((v) => v.versionId));
-  const unmigratedLocalCount = localVersionHistory.filter(
-    (v) => !serverVersionIds.has(v.versionId)
-  ).length;
-  const errorIssuesCount = preview?.issues.filter((i) => i.severity === 'error').length ?? 0;
-  const warningIssuesCount = preview?.issues.filter((i) => i.severity === 'warning').length ?? 0;
+  const templateSpec = getDatasetTemplateSpec(selectedKind);
 
   return (
     <div className="space-y-6">
-      {authActionError && (
+      {/* Status Banner */}
+      {actionBanner && (
         <div
-          role="alert"
-          className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] px-4 py-3 text-[13px] font-medium text-[#641016]"
+          role="status"
+          className={`rounded-md border px-4 py-3 text-sm flex items-start gap-2.5 ${
+            actionBanner.type === 'success'
+              ? 'border-[#B8DEC9] bg-[#ECF7F2] text-[#0B5D3F]'
+              : 'border-[#E8B8BC] bg-[#FDF2F3] text-[#641016]'
+          }`}
         >
-          {authActionError}
+          {actionBanner.type === 'success' ? (
+            <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5" />
+          ) : (
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-[#9D1D26]" />
+          )}
+          <span className="leading-relaxed">{actionBanner.message}</span>
         </div>
       )}
 
-      {/* Header, Server Storage Summary & Isolated DEMO Control */}
-      <div className="banking-card p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="max-w-3xl">
-            <div className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-[#0B5D3F]">
-              <Database className="h-4 w-4" />
-              M1.2 · Lưu trữ phiên bản tập trung trên máy chủ · Hỗ trợ Excel / CSV / JSON & Tọa độ GPS
-            </div>
-            <h2 className="mt-1 banking-page-title">
-              Quản lý Bộ dữ liệu nguồn (Excel / CSV / JSON / PDF)
-            </h2>
-            <p className="mt-1.5 text-sm leading-relaxed text-[#4B5563]">
-              Nạp dữ liệu Bảng giá đất Nhà nước, báo cáo ECOVIS, quy định hệ số K và khảo sát thị trường. Dữ liệu sau khi kiểm lỗi và xác nhận sẽ được lưu bền vững theo từng phiên bản trên máy chủ để toàn bộ giao diện tra cứu công khai sử dụng thống nhất.
-            </p>
+      {overviewError && (
+        <div
+          role="alert"
+          className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] px-4 py-3 text-sm text-[#641016] flex items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-[#9D1D26]" />
+            <span>{overviewError}</span>
           </div>
-
-          <div className="rounded-md border border-[#EAD196] bg-[#FEF7E6] p-4 text-[13px] max-w-sm shrink-0">
-            <div className="flex items-center justify-between gap-3">
-              <span className="font-semibold text-[#6E4200]">Khu vực dữ liệu DEMO tách biệt</span>
-              <button
-                type="button"
-                onClick={() => setIsDemoMode(!isDemoMode)}
-                className={`rounded-md px-3 py-1.5 text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors ${
-                  isDemoMode
-                    ? 'bg-[#8A5300] text-white hover:bg-[#6E4200]'
-                    : 'bg-white border border-[#EAD196] text-[#6E4200] hover:bg-[#FCEEC8]'
-                }`}
-              >
-                {isDemoMode ? 'Đang bật DEMO (Tắt)' : 'Bật dữ liệu DEMO'}
-              </button>
-            </div>
-            <p className="mt-2 text-xs text-[#6E4200] leading-relaxed">
-              Dữ liệu DEMO được gắn nhãn [DEMO] và cô lập hoàn toàn trong bộ nhớ phiên, tuyệt đối không lưu lẫn vào kho dữ liệu thật trên máy chủ.
-            </p>
-          </div>
+          <button
+            type="button"
+            onClick={() => void loadOverview()}
+            className="banking-btn-secondary !min-h-[34px] !px-3 !text-xs shrink-0"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            Tải lại
+          </button>
         </div>
+      )}
 
-        {/* Live Server Dataset Counters */}
-        <div className="grid grid-cols-2 gap-3 border-t border-[#E2E5E9] pt-4 sm:grid-cols-5 text-[13px]">
-          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5">
-            <div className="text-xs text-[#6B7280]">Giá Nhà nước</div>
-            <div className="mt-0.5 font-mono text-base font-bold text-[#1F2429] tabular-nums">
-              {(serverOverview?.counts.statePrice ?? 0).toLocaleString('vi-VN')} dòng
-            </div>
-          </div>
-          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5">
-            <div className="text-xs text-[#6B7280]">Khảo sát ECOVIS</div>
-            <div className="mt-0.5 font-mono text-base font-bold text-[#1F2429] tabular-nums">
-              {(serverOverview?.counts.ecovis ?? 0).toLocaleString('vi-VN')} dòng
-            </div>
-          </div>
-          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5">
-            <div className="text-xs text-[#6B7280]">Quy định Hệ số K</div>
-            <div className="mt-0.5 font-mono text-base font-bold text-[#1F2429] tabular-nums">
-              {(serverOverview?.counts.kFactorRules ?? 0).toLocaleString('vi-VN')} dòng
-            </div>
-          </div>
-          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5">
-            <div className="text-xs text-[#6B7280]">Tin thị trường</div>
-            <div className="mt-0.5 font-mono text-base font-bold text-[#1F2429] tabular-nums">
-              {(serverOverview?.counts.marketSurvey ?? 0).toLocaleString('vi-VN')} dòng
-            </div>
-          </div>
-          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5 col-span-2 sm:col-span-1 flex flex-col justify-between">
-            <div className="text-xs text-[#6B7280]">Phiên bản đã lưu</div>
-            <div className="mt-0.5 flex items-center justify-between">
-              <span className="font-mono text-base font-bold text-[#1F2429] tabular-nums">
-                {serverOverview?.counts.totalVersions ?? 0}
-              </span>
-              <button
-                type="button"
-                disabled={loadingOverview}
-                onClick={() => void loadServerOverview()}
-                className="text-[#9D1D26] hover:text-[#7F151D] disabled:opacity-50 cursor-pointer"
-                title="Làm mới danh sách từ máy chủ"
-              >
-                <RefreshCw className={`h-4 w-4 ${loadingOverview ? 'animate-spin' : ''}`} />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Non-destructive Migration Banner if browser localStorage has unsynced legacy real versions */}
-        {localVersionsCount > 0 && unmigratedLocalCount > 0 && (
-          <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] px-4 py-3.5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between text-[13px] text-[#641016]">
-            <div>
-              <strong>Phát hiện {unmigratedLocalCount} phiên bản dữ liệu cục bộ trên trình duyệt</strong> chưa được đồng bộ lên máy chủ. Bạn có thể sao chép lên kho máy chủ mà không làm mất dữ liệu hiện có.
-            </div>
-            <button
-              type="button"
-              disabled={actionBusy}
-              onClick={() => void handleMigrateLocalToServer()}
-              className="banking-btn-primary whitespace-nowrap shrink-0"
-            >
-              <Upload className="h-4 w-4" />
-              Đồng bộ dữ liệu cục bộ lên máy chủ
-            </button>
-          </div>
-        )}
-
-        {migrationMessage && (
-          <div className="rounded-md border border-[#B8DEC9] bg-[#ECF7F2] px-4 py-3 text-[13px] text-[#084730] flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 shrink-0 text-[#0B5D3F]" />
-            <span>{migrationMessage}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Section 1: Excel / CSV / JSON Import with Mandatory Preview & Validation */}
-      <section className="banking-card p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col gap-3 border-b border-[#E2E5E9] pb-4 sm:flex-row sm:items-center sm:justify-between">
+      {/* 1. Active Datasets Overview on Cloud Firestore */}
+      <section className="banking-card p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <div>
-            <h3 className="banking-section-title">
-              1. Nhập dữ liệu từ Excel (.xlsx), CSV (.csv) hoặc JSON (.json)
-            </h3>
-            <p className="mt-1 text-[13px] text-[#4B5563]">
-              Hỗ trợ thêm cột tọa độ không gian tùy chọn (<code className="font-mono text-[#1F2429]">vi_do</code>, <code className="font-mono text-[#1F2429]">kinh_do</code>) để chuẩn bị cho đối chiếu bán kính lân cận. Không tự động tạo tọa độ nếu nguồn không có.
+            <h2 className="banking-section-title flex items-center gap-2">
+              <Database className="h-4 w-4 text-[#9D1D26]" />
+              Trạng thái Kho dữ liệu Cloud Firestore ({firestoreDatabaseId})
+            </h2>
+            <p className="text-xs text-[#6B7280] mt-0.5">
+              Dữ liệu đang kích hoạt tại collection <code className="font-mono">/active_versions</code> được hiển thị công khai trên trang tra cứu.
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            disabled={loadingOverview}
+            onClick={() => void loadOverview()}
+            className="banking-btn-secondary !min-h-[36px] !px-3 !text-[13px]"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loadingOverview ? 'animate-spin' : ''}`} />
+            Làm mới
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+          {ALL_DATASET_KINDS.map((kind) => {
+            const ptr = overview?.activePointers[kind] ?? null;
+            const totalVersions = overview?.versions[kind]?.length ?? 0;
+            return (
+              <div
+                key={kind}
+                className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] p-3.5 space-y-1.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-[#1F2429]">
+                    {getKindLabel(kind)}
+                  </span>
+                  <span className="text-[11px] font-mono text-[#6B7280]">
+                    {totalVersions} phiên bản
+                  </span>
+                </div>
+                {ptr ? (
+                  <>
+                    <div className="banking-figure text-xl font-bold text-[#0B5D3F]">
+                      {ptr.rowCount.toLocaleString('vi-VN')} dòng
+                    </div>
+                    <div className="text-xs text-[#4B5563] truncate" title={ptr.versionLabel}>
+                      {ptr.versionLabel}
+                    </div>
+                    <div className="text-[11px] text-[#6B7280] flex items-center gap-2">
+                      <span className="inline-flex items-center gap-0.5">
+                        <MapPin className="h-3 w-3" />
+                        {ptr.spatialRecordsCount} GPS
+                      </span>
+                      <span>· {ptr.effectiveDate}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="banking-figure text-lg font-semibold text-[#6B7280]">
+                      Chưa kích hoạt
+                    </div>
+                    <div className="text-xs text-[#6B7280]">
+                      Chưa có phiên bản chính thức
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 2. Staging-First Import Panel */}
+      <section className="banking-card p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#E2E5E9] pb-4">
+          <div>
+            <h2 className="banking-section-title flex items-center gap-2">
+              <FileSpreadsheet className="h-4 w-4 text-[#9D1D26]" />
+              Nạp bộ dữ liệu mới (Staging-First &amp; Xác minh nguyên tử)
+            </h2>
+            <p className="text-xs text-[#6B7280] mt-0.5">
+              Dữ liệu được kiểm lỗi trước khi nạp, ghi theo lô ≤ 400 bản ghi vào trạng thái staging, đối chiếu đủ số dòng trên máy chủ rồi mới kích hoạt.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
             <button
               type="button"
-              onClick={() => downloadExcelTemplate(selectedKind)}
-              className="banking-btn-secondary !min-h-[36px] !px-3 !py-1.5 !text-[13px] whitespace-nowrap"
+              onClick={() => void downloadExcelTemplate(selectedKind)}
+              className="banking-btn-secondary !min-h-[36px] !px-3 !text-xs"
             >
-              <Download className="h-3.5 w-3.5 text-[#0B5D3F]" />
-              Tải mẫu Excel (.xlsx)
+              <Download className="h-3.5 w-3.5" />
+              Tải mẫu Excel
             </button>
             <button
               type="button"
               onClick={() => downloadJsonTemplate(selectedKind)}
-              className="banking-btn-secondary !min-h-[36px] !px-3 !py-1.5 !text-[13px] whitespace-nowrap"
+              className="banking-btn-secondary !min-h-[36px] !px-3 !text-xs"
             >
-              <FileJson className="h-3.5 w-3.5 text-[#9D1D26]" />
-              Tải mẫu JSON (.json)
+              <Download className="h-3.5 w-3.5" />
+              Tải mẫu JSON
             </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <div className="md:col-span-2">
-            <label className="banking-label">
-              Nhóm dữ liệu cần nạp <span className="text-[#9D1D26]">*</span>
-            </label>
-            <select
-              value={selectedKind}
-              onChange={(e) => {
-                setSelectedKind(e.target.value as DatasetKind);
-                setPreview(null);
-                setParseError(null);
-              }}
-              className="banking-input"
+        {/* Dataset Kind Tabs */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          {DATASET_KIND_OPTIONS.map((opt) => (
+            <button
+              key={opt.kind}
+              type="button"
+              disabled={committing}
+              onClick={() => handleKindChange(opt.kind)}
+              className={`px-3 py-2.5 rounded-md border text-xs font-semibold text-left transition-colors cursor-pointer ${
+                selectedKind === opt.kind
+                  ? 'border-[#9D1D26] bg-[#FDF2F3] text-[#9D1D26]'
+                  : 'border-[#E2E5E9] bg-white text-[#4B5563] hover:bg-[#F8F9FA]'
+              }`}
             >
-              <option value="state_price">{DATASET_LABELS.state_price}</option>
-              <option value="ecovis">{DATASET_LABELS.ecovis}</option>
-              <option value="k_factor_rules">{DATASET_LABELS.k_factor_rules}</option>
-              <option value="market_survey">{DATASET_LABELS.market_survey}</option>
-            </select>
-          </div>
-          <div>
-            <label className="banking-label">Tên tài liệu / Văn bản nguồn</label>
-            <input
-              type="text"
-              placeholder="VD: Nghị quyết 15/2025/NQ-HĐND"
-              value={sourceDocumentName}
-              onChange={(e) => setSourceDocumentName(e.target.value)}
-              className="banking-input"
-            />
-          </div>
-          <div>
-            <label className="banking-label">Ngày hiệu lực / Thời điểm báo cáo</label>
-            <input
-              type="date"
-              value={effectiveDate}
-              onChange={(e) => setEffectiveDate(e.target.value)}
-              className="banking-input font-mono"
-            />
-          </div>
+              {opt.label}
+            </button>
+          ))}
         </div>
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        {/* Provenance Metadata Inputs */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <div>
-            <label className="banking-label">Nhãn phiên bản dữ liệu (để lưu lịch sử)</label>
+            <label htmlFor="adm-ver-label" className="banking-label">
+              Nhãn phiên bản
+            </label>
             <input
-              type="text"
-              placeholder="VD: NQ15-2025 v1.0 – Đợt nhập tháng 01/2026"
+              id="adm-ver-label"
               value={versionLabel}
               onChange={(e) => setVersionLabel(e.target.value)}
+              placeholder={`VD: ${getKindLabel(selectedKind)} 2026 v1`}
               className="banking-input"
             />
           </div>
           <div>
-            <label className="banking-label">Ghi chú phiên bản nhập</label>
+            <label htmlFor="adm-source-doc" className="banking-label">
+              Văn bản / Nguồn dữ liệu *
+            </label>
             <input
-              type="text"
-              placeholder="Ghi rõ phạm vi địa bàn, người kiểm tra bảng..."
-              value={importNotes}
-              onChange={(e) => setImportNotes(e.target.value)}
+              id="adm-source-doc"
+              value={sourceDocumentName}
+              onChange={(e) => setSourceDocumentName(e.target.value)}
+              placeholder="Tên Nghị quyết / Báo cáo nguồn"
+              className="banking-input"
+            />
+          </div>
+          <div>
+            <label htmlFor="adm-eff-date" className="banking-label">
+              Ngày hiệu lực / Khảo sát *
+            </label>
+            <input
+              id="adm-eff-date"
+              value={effectiveDate}
+              onChange={(e) => setEffectiveDate(e.target.value)}
+              placeholder="01/01/2026"
+              className="banking-input"
+            />
+          </div>
+          <div>
+            <label htmlFor="adm-notes" className="banking-label">
+              Ghi chú phiên bản
+            </label>
+            <input
+              id="adm-notes"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="VD: Phạm vi Huyện Khánh Sơn"
               className="banking-input"
             />
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
-          <input
-            ref={spreadsheetInputRef}
-            type="file"
-            accept=".xlsx,.csv,.json"
-            onChange={(e) => handleSpreadsheetSelected(e.target.files?.[0] ?? null)}
-            className="hidden"
-          />
-          <button
-            type="button"
-            disabled={actionBusy}
-            onClick={() => spreadsheetInputRef.current?.click()}
-            className="banking-btn-primary"
-          >
-            <FileSpreadsheet className="h-4 w-4" />
-            Chọn tệp Excel (.xlsx) / CSV / JSON để xem trước & kiểm lỗi
-          </button>
-          <span className="text-[13px] text-[#6B7280]">
-            Kiểm tra cột bắt buộc, mã trùng, định dạng số VNĐ/thập phân và tọa độ GPS chuẩn WGS84 trước khi lưu máy chủ.
-          </span>
+        {/* File Picker */}
+        <div className="rounded-md border border-dashed border-[#CBD2D9] bg-[#F8F9FA] p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="text-xs text-[#4B5563] space-y-1">
+            <div className="font-semibold text-[#1F2429]">
+              Chọn tệp Excel (.xlsx), CSV hoặc JSON cho nhóm {getKindLabel(selectedKind)}
+            </div>
+            <div>
+              Cột chuẩn gợi ý: <span className="font-mono">{templateSpec.headers.slice(0, 6).join(', ')}…</span>
+            </div>
+          </div>
+          <label className="banking-btn-primary cursor-pointer shrink-0 !min-h-[40px]">
+            {parsingFile ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Upload className="h-4 w-4" />
+            )}
+            <span>{parsingFile ? 'Đang phân tích tệp...' : 'Chọn tệp để kiểm lỗi'}</span>
+            <input
+              type="file"
+              accept=".xlsx,.csv,.json"
+              disabled={parsingFile || committing}
+              onChange={(e) => void handleFileUpload(e)}
+              className="hidden"
+            />
+          </label>
         </div>
 
         {parseError && (
-          <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] p-3.5 text-[13px] text-[#641016]">
-            <strong>Lỗi nhập dữ liệu:</strong> {parseError} — Dữ liệu hiện tại được giữ nguyên.
+          <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] px-3.5 py-2.5 text-[13px] text-[#641016]">
+            {parseError}
           </div>
         )}
 
-        {commitSuccess && (
-          <div className="rounded-md border border-[#B8DEC9] bg-[#ECF7F2] p-3.5 text-[13px] text-[#084730] flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 shrink-0 text-[#0B5D3F]" />
-            <span>{commitSuccess}</span>
-          </div>
-        )}
-
-        {/* Strict Preview & Validation Result Panel */}
+        {/* Import Preview & Validation Result */}
         {preview && (
-          <div className="rounded-md border border-[#CBD2D9] bg-[#F8F9FA] p-5 space-y-4">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#E2E5E9] pb-3.5">
-              <div>
-                <div className="text-[15px] font-semibold text-[#1F2429]">
-                  Xem trước kiểm tra tệp: {preview.fileName}
-                  {preview.selectedSheetName ? ` (Sheet: ${preview.selectedSheetName})` : ''}
-                </div>
-                <div className="mt-1 text-xs text-[#4B5563] font-mono tabular-nums">
-                  {preview.detectedHeaderRowNumber ? `Tiêu đề dòng #${preview.detectedHeaderRowNumber} · ` : ''}
-                  Tổng dòng: {preview.totalRows} · Hợp lệ: {preview.validRows.length} · Có tọa độ GPS:{' '}
-                  {preview.validSpatialCount ?? 0} · Mã trùng: {preview.duplicateCodes.length} · Lỗi chặn:{' '}
-                  {errorIssuesCount} · Cảnh báo: {warningIssuesCount}
+          <div className="rounded-md border border-[#E2E5E9] bg-white p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-[#1F2429]">
+                Kết quả kiểm lỗi: {preview.fileName}
+                {preview.selectedSheetName ? ` (Sheet: ${preview.selectedSheetName})` : ''}
+              </div>
+              <span
+                className={`text-xs font-semibold ${
+                  preview.canCommit ? 'text-[#0B5D3F]' : 'text-[#9D1D26]'
+                }`}
+              >
+                {preview.canCommit ? 'Đạt điều kiện nạp Firestore' : 'Cần xử lý lỗi trước khi nạp'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+              <div className="rounded border border-[#E2E5E9] bg-[#F8F9FA] p-2.5">
+                <div className="text-[#6B7280]">Tổng dòng đọc</div>
+                <div className="mt-0.5 font-mono text-sm font-bold text-[#1F2429]">
+                  {preview.totalRows.toLocaleString('vi-VN')}
                 </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                {preview.canCommit ? (
-                  <button
-                    type="button"
-                    disabled={actionBusy}
-                    onClick={() => void handleCommitImport()}
-                    className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-md bg-[#0B5D3F] px-4 py-2 text-sm font-semibold text-white hover:bg-[#084730] disabled:opacity-60 cursor-pointer"
-                  >
-                    <ShieldCheck className="h-4 w-4" />
-                    {actionBusy ? 'Đang lưu máy chủ...' : 'Xác nhận lưu phiên bản lên máy chủ'}
-                  </button>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 rounded-md border border-[#E8B8BC] bg-[#FDF2F3] px-3 py-2 text-[13px] font-semibold text-[#9D1D26]">
-                    <AlertTriangle className="h-4 w-4" />
-                    Bị chặn nhập do có sai lệch · Giữ nguyên dữ liệu gốc
-                  </span>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setPreview(null)}
-                  className="banking-btn-secondary"
-                >
-                  Hủy xem trước
-                </button>
+              <div className="rounded border border-[#E2E5E9] bg-[#F8F9FA] p-2.5">
+                <div className="text-[#6B7280]">Bản ghi hợp lệ</div>
+                <div className="mt-0.5 font-mono text-sm font-bold text-[#0B5D3F]">
+                  {preview.validRows.length.toLocaleString('vi-VN')}
+                </div>
+              </div>
+              <div className="rounded border border-[#E2E5E9] bg-[#F8F9FA] p-2.5">
+                <div className="text-[#6B7280]">Có tọa độ GPS</div>
+                <div className="mt-0.5 font-mono text-sm font-bold text-[#1F2429]">
+                  {(preview.validSpatialCount ?? 0).toLocaleString('vi-VN')}
+                </div>
+              </div>
+              <div className="rounded border border-[#E2E5E9] bg-[#F8F9FA] p-2.5">
+                <div className="text-[#6B7280]">Lỗi / Cảnh báo</div>
+                <div className="mt-0.5 font-mono text-sm font-bold text-[#9D1D26]">
+                  {preview.issues.filter((i) => i.severity === 'error').length} /{' '}
+                  {preview.issues.filter((i) => i.severity === 'warning').length}
+                </div>
               </div>
             </div>
 
             {preview.missingRequiredColumns.length > 0 && (
-              <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] p-3.5 text-[13px] text-[#641016]">
-                <strong>Thiếu cột bắt buộc:</strong> {preview.missingRequiredColumns.join(', ')}.
-              </div>
-            )}
-
-            {preview.duplicateCodes.length > 0 && (
-              <div className="rounded-md border border-[#E8B8BC] bg-[#FDF2F3] p-3.5 text-[13px] text-[#641016]">
-                <strong>Phát hiện mã dữ liệu trùng lặp:</strong> {preview.duplicateCodes.slice(0, 10).join(', ')}
-                {preview.duplicateCodes.length > 10 ? ` (+${preview.duplicateCodes.length - 10} mã khác)` : ''}.
+              <div className="text-xs text-[#9D1D26]">
+                Thiếu cột bắt buộc: {preview.missingRequiredColumns.join(', ')}
               </div>
             )}
 
             {preview.issues.length > 0 && (
-              <div className="max-h-52 overflow-y-auto rounded-md border border-[#E2E5E9] bg-white">
-                <table className="w-full text-left text-[13px]">
-                  <thead>
-                    <tr className="border-b border-[#E2E5E9] bg-[#F8F9FA] text-[#1F2429] font-semibold">
-                      <th className="px-3 py-2">Dòng</th>
-                      <th className="px-3 py-2">Mức độ</th>
-                      <th className="px-3 py-2">Trường</th>
-                      <th className="px-3 py-2">Mô tả sai lệch / lưu ý</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#E2E5E9]">
-                    {preview.issues.slice(0, 30).map((issue, idx) => (
-                      <tr key={idx}>
-                        <td className="px-3 py-2 font-mono text-[#4B5563]">{issue.rowNumber}</td>
-                        <td className="px-3 py-2 font-semibold">
-                          {issue.severity === 'error' ? (
-                            <span className="text-[#9D1D26]">Lỗi chặn</span>
-                          ) : (
-                            <span className="text-[#8A5300]">Cảnh báo</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 font-medium text-[#1F2429]">{issue.field}</td>
-                        <td
-                          className={`px-3 py-2 ${
-                            issue.severity === 'error' ? 'text-[#9D1D26]' : 'text-[#8A5300]'
-                          }`}
-                        >
-                          {issue.message}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="max-h-40 overflow-y-auto rounded border border-[#E2E5E9] bg-[#F8F9FA] p-2.5 space-y-1 text-xs">
+                {preview.issues.slice(0, 25).map((issue, idx) => (
+                  <div
+                    key={`${issue.rowNumber}-${idx}`}
+                    className={
+                      issue.severity === 'error' ? 'text-[#9D1D26]' : 'text-[#784A0A]'
+                    }
+                  >
+                    Dòng {issue.rowNumber} [{issue.field}]: {issue.message}
+                  </div>
+                ))}
+                {preview.issues.length > 25 && (
+                  <div className="text-[#6B7280]">
+                    … và {preview.issues.length - 25} cảnh báo/lỗi khác.
+                  </div>
+                )}
               </div>
             )}
 
-            {preview.validRows.length > 0 && (
-              <div>
-                <div className="text-[13px] font-semibold text-[#1F2429] mb-2">
-                  Xem trước 5 dòng hợp lệ đầu tiên:
-                </div>
-                <div className="overflow-x-auto rounded-md border border-[#E2E5E9] bg-white">
-                  <table className="w-full text-left text-[13px]">
-                    <thead>
-                      <tr className="border-b border-[#E2E5E9] bg-[#F8F9FA] text-[#1F2429] font-semibold">
-                        <th className="px-3 py-2.5">Mã</th>
-                        <th className="px-3 py-2.5">Nội dung chính</th>
-                        <th className="px-3 py-2.5">Giá trị / Đơn giá</th>
-                        <th className="px-3 py-2.5">Tọa độ GPS</th>
-                        <th className="px-3 py-2.5">Nguồn / Trang</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#E2E5E9]">
-                      {preview.validRows.slice(0, 5).map((row) => {
-                        const lat = 'latitude' in row ? row.latitude : null;
-                        const lng = 'longitude' in row ? row.longitude : null;
-                        const coordCell =
-                          typeof lat === 'number' && typeof lng === 'number' ? (
-                            <span className="inline-flex items-center gap-1 font-mono text-xs text-[#0B5D3F]">
-                              <MapPin className="h-3.5 w-3.5" />
-                              {lat.toFixed(5)}, {lng.toFixed(5)}
-                            </span>
-                          ) : (
-                            <span className="text-[#6B7280]">Không có</span>
-                          );
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-2 border-t border-[#E2E5E9]">
+              <label className="inline-flex items-center gap-2 text-xs font-medium text-[#1F2429] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={activateImmediately}
+                  onChange={(e) => setActivateImmediately(e.target.checked)}
+                  className="h-4 w-4 accent-[#0B5D3F]"
+                />
+                Kích hoạt công khai ngay sau khi xác minh đủ 100% số dòng trên Cloud Firestore
+              </label>
 
-                        if ('unitPrice' in row) {
-                          return (
-                            <tr key={row.id}>
-                              <td className="px-3 py-2.5 font-mono">{row.recordCode}</td>
-                              <td className="px-3 py-2.5">
-                                {row.streetName} · {row.wardCommune} · {row.position}
-                              </td>
-                              <td className="px-3 py-2.5 font-mono tabular-nums font-semibold">
-                                {row.unitPrice.toLocaleString('vi-VN')} {row.unit}
-                              </td>
-                              <td className="px-3 py-2.5">{coordCell}</td>
-                              <td className="px-3 py-2.5">{row.sourcePageOrAppendix}</td>
-                            </tr>
-                          );
-                        }
-                        if ('surveyUnitPrice' in row) {
-                          return (
-                            <tr key={row.id}>
-                              <td className="px-3 py-2.5 font-mono">{row.recordCode}</td>
-                              <td className="px-3 py-2.5">
-                                {row.streetName} · {row.position}
-                              </td>
-                              <td className="px-3 py-2.5 font-mono tabular-nums font-semibold">
-                                {row.surveyUnitPrice.toLocaleString('vi-VN')} {row.unit}
-                              </td>
-                              <td className="px-3 py-2.5">{coordCell}</td>
-                              <td className="px-3 py-2.5">{row.appendixAndPage}</td>
-                            </tr>
-                          );
-                        }
-                        if ('factorValue' in row) {
-                          return (
-                            <tr key={row.id}>
-                              <td className="px-3 py-2.5 font-mono">{row.ruleCode}</td>
-                              <td className="px-3 py-2.5">{row.factorName}</td>
-                              <td className="px-3 py-2.5 font-mono tabular-nums font-semibold">K = {row.factorValue}</td>
-                              <td className="px-3 py-2.5 text-[#6B7280]">—</td>
-                              <td className="px-3 py-2.5">{row.sourcePage}</td>
-                            </tr>
-                          );
-                        }
-                        return (
-                          <tr key={row.id}>
-                            <td className="px-3 py-2.5 font-mono">{row.listingCode}</td>
-                            <td className="px-3 py-2.5">
-                              {row.address} ({row.sourceName})
-                            </td>
-                            <td className="px-3 py-2.5 font-mono tabular-nums font-semibold">
-                              {row.unitPricePerSqm?.toLocaleString('vi-VN')} VNĐ/m²
-                            </td>
-                            <td className="px-3 py-2.5">{coordCell}</td>
-                            <td className="px-3 py-2.5">{row.postedDate || 'Chưa ghi ngày'}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
+              <button
+                type="button"
+                disabled={!preview.canCommit || committing}
+                onClick={() => void handleCommitToFirestore()}
+                className="banking-btn-primary shrink-0"
+              >
+                {committing ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Database className="h-4 w-4" />
+                )}
+                <span>
+                  {committing
+                    ? 'Đang nạp lên Cloud Firestore...'
+                    : `Nạp ${preview.validRows.length.toLocaleString('vi-VN')} bản ghi vào Firestore`}
+                </span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Batch Upload Progress Indicator */}
+        {progress && (
+          <div className="rounded-md border border-[#D4E4DC] bg-[#F2F8F5] p-3.5 space-y-2 text-xs text-[#174632]">
+            <div className="flex items-center justify-between gap-2 font-medium">
+              <span>{progress.message}</span>
+              <span className="font-mono">
+                {progress.writtenRows}/{progress.totalRows}
+              </span>
+            </div>
+            <div className="h-2 w-full rounded bg-white overflow-hidden border border-[#D4E4DC]">
+              <div
+                className="h-full bg-[#0B5D3F] transition-all duration-200"
+                style={{
+                  width: `${
+                    progress.totalRows > 0
+                      ? Math.min(100, Math.round((progress.writtenRows / progress.totalRows) * 100))
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
           </div>
         )}
       </section>
 
-      {/* Section 2: PDF Reference Documents Archive */}
-      <section className="banking-card p-5 sm:p-6 space-y-4">
-        <div className="border-b border-[#E2E5E9] pb-3">
-          <h3 className="banking-section-title">
-            2. Lưu trữ hồ sơ tài liệu PDF gốc làm căn cứ đối chiếu
-          </h3>
-          <p className="mt-1 text-[13px] text-[#4B5563]">
-            Lưu trữ siêu dữ liệu văn bản PDF (Nghị quyết 15/2025/NQ-HĐND, Báo cáo ECOVIS, Quy định hệ số K) lên máy chủ kèm số trang và ghi chú phụ lục để trích dẫn thống nhất trong báo cáo.
+      {/* 3. Version History, Rollback & JSON Backup */}
+      <section className="banking-card p-5 space-y-4">
+        <div>
+          <h2 className="banking-section-title flex items-center gap-2">
+            <History className="h-4 w-4 text-[#9D1D26]" />
+            Lịch sử phiên bản, Khôi phục (Rollback) &amp; Sao lưu JSON
+          </h2>
+          <p className="text-xs text-[#6B7280] mt-0.5">
+            Các phiên bản đã xác nhận (committed) là bất biến và không bị xóa vĩnh viễn để bảo toàn dấu vết kiểm toán.
           </p>
         </div>
 
-        <div className="rounded-md border border-[#EAD196] bg-[#FEF7E6] px-4 py-3 text-[13px] text-[#6E4200]">
-          <strong>Trạng thái kỹ thuật OCR bảng biểu PDF:</strong>{' '}
-          <span className="font-semibold">
-            Chưa triển khai trích xuất bảng giá tự động từ PDF scan
-          </span>{' '}
-          (nhằm tránh sai lệch số liệu pháp lý). Cán bộ tải PDF vào đây để lưu làm nguồn đối chiếu gốc và sử dụng mục 1 (Excel/CSV/JSON) để nạp bảng số liệu đã kiểm chuẩn.
+        <div className="space-y-4">
+          {ALL_DATASET_KINDS.map((kind) => {
+            const list = overview?.versions[kind] ?? [];
+            return (
+              <div key={kind} className="space-y-2">
+                <div className="text-xs font-semibold uppercase tracking-wide text-[#4B5563]">
+                  {getKindLabel(kind)} ({list.length})
+                </div>
+                {list.length === 0 ? (
+                  <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-2.5 text-xs text-[#6B7280]">
+                    Chưa có phiên bản nào được lưu trên Cloud Firestore cho nhóm này.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-[#E2E5E9] rounded-md border border-[#E2E5E9] overflow-hidden">
+                    {list.map((ver) => {
+                      const isBusyRow = busyVersionId === ver.versionId;
+                      const canSwitch = ver.commitState === 'committed' && !ver.isActive;
+                      return (
+                        <div
+                          key={ver.versionId}
+                          className="p-3.5 bg-white flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3"
+                        >
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold text-[#1F2429]">
+                                {ver.versionLabel}
+                              </span>
+                              {ver.isActive && (
+                                <span className="text-[11px] font-semibold text-[#0B5D3F] bg-[#ECF7F2] border border-[#B8DEC9] px-2 py-0.5 rounded">
+                                  Đang kích hoạt
+                                </span>
+                              )}
+                              {ver.commitState !== 'committed' && (
+                                <span className="text-[11px] font-semibold text-[#9D1D26] bg-[#FDF2F3] border border-[#E8B8BC] px-2 py-0.5 rounded">
+                                  {ver.commitState === 'staging' ? 'Staging (chưa xác nhận)' : 'Aborted (đã hủy)'}
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-xs text-[#4B5563] flex flex-wrap gap-x-3 gap-y-0.5">
+                              <span className="font-mono">{ver.versionId}</span>
+                              <span>
+                                {ver.verifiedRowCount.toLocaleString('vi-VN')}/
+                                {ver.expectedRowCount.toLocaleString('vi-VN')} dòng ({ver.spatialRecordsCount} GPS)
+                              </span>
+                              <span>Hiệu lực: {ver.effectiveDate}</span>
+                              <span>Nạp lúc: {formatDateTimeVi(ver.importedAt)}</span>
+                            </div>
+                            <div className="text-[11px] text-[#6B7280] flex flex-wrap gap-x-3 gap-y-0.5">
+                              <span>Nguồn: {ver.sourceDocumentName}</span>
+                              {ver.payloadChecksum && (
+                                <span className="font-mono">
+                                  SHA-256: {ver.payloadChecksum.slice(0, 12)}…
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            {canSwitch && (
+                              <button
+                                type="button"
+                                disabled={isBusyRow}
+                                onClick={() =>
+                                  void handleActivateOrRollback(
+                                    ver,
+                                    overview?.activePointers[kind] ? 'rollback' : 'activate'
+                                  )
+                                }
+                                className="banking-btn-secondary !min-h-[34px] !px-3 !text-xs"
+                              >
+                                {isBusyRow ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="h-3.5 w-3.5" />
+                                )}
+                                {overview?.activePointers[kind] ? 'Khôi phục phiên bản này' : 'Kích hoạt'}
+                              </button>
+                            )}
+                            {ver.commitState === 'committed' && (
+                              <button
+                                type="button"
+                                disabled={isBusyRow}
+                                onClick={() => void handleExportJsonBackup(ver)}
+                                className="banking-btn-secondary !min-h-[34px] !px-3 !text-xs"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                Xuất JSON
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 4. Immutable Activation & Rollback Audit Log */}
+      <section className="banking-card p-5 space-y-3">
+        <div>
+          <h2 className="banking-section-title">
+            Nhật ký kích hoạt &amp; khôi phục (/activation_history)
+          </h2>
+          <p className="text-xs text-[#6B7280] mt-0.5">
+            Ghi nhận nguyên tử mọi sự kiện chuyển phiên bản đang hoạt động (chỉ ghi nối tiếp, không sửa/xóa).
+          </p>
         </div>
 
-        <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-5">
-          <div className="lg:col-span-2">
-            <label className="banking-label">Tên tài liệu PDF</label>
+        {(overview?.activationHistory.length ?? 0) === 0 ? (
+          <div className="rounded-md border border-[#E2E5E9] bg-[#F8F9FA] px-3.5 py-3 text-xs text-[#6B7280]">
+            Chưa có sự kiện kích hoạt hoặc khôi phục nào.
+          </div>
+        ) : (
+          <div className="divide-y divide-[#E2E5E9] rounded-md border border-[#E2E5E9] max-h-64 overflow-y-auto">
+            {overview!.activationHistory.slice(0, 30).map((evt) => (
+              <div
+                key={evt.eventId}
+                className="p-3 bg-white text-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5"
+              >
+                <div className="space-y-0.5">
+                  <div className="font-semibold text-[#1F2429]">
+                    [{evt.action === 'rollback' ? 'KHÔI PHỤC' : 'KÍCH HOẠT'}]{' '}
+                    {getKindLabel(evt.datasetKind)}:{' '}
+                    <span className="font-mono text-[#6B7280]">
+                      {evt.fromVersionId || '(chưa có)'}
+                    </span>{' '}
+                    → <span className="font-mono text-[#0B5D3F]">{evt.toVersionId}</span>
+                  </div>
+                  {evt.reason && <div className="text-[#4B5563]">{evt.reason}</div>}
+                </div>
+                <div className="text-[11px] text-[#6B7280] sm:text-right shrink-0">
+                  <div>{evt.actorEmail}</div>
+                  <div className="font-mono">{formatDateTimeVi(evt.createdAt)}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* 5. PDF Source Metadata Catalog (/pdf_documents) */}
+      <section className="banking-card p-5 space-y-4">
+        <div>
+          <h2 className="banking-section-title flex items-center gap-2">
+            <FileText className="h-4 w-4 text-[#9D1D26]" />
+            Danh mục tài liệu PDF nguồn (/pdf_documents)
+          </h2>
+          <p className="text-xs text-[#6B7280] mt-0.5">
+            Chỉ lưu siêu dữ liệu văn bản pháp lý &amp; phụ lục trên Cloud Firestore (không dùng Firebase Storage).
+          </p>
+        </div>
+
+        <form onSubmit={(e) => void handleSavePdfMetadata(e)} className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label htmlFor="pdf-title" className="banking-label">
+              Tên văn bản / Báo cáo *
+            </label>
             <input
-              type="text"
-              placeholder="VD: Nghị quyết 15/2025/NQ-HĐND tỉnh Khánh Hòa"
+              id="pdf-title"
+              required
               value={pdfTitle}
               onChange={(e) => setPdfTitle(e.target.value)}
+              placeholder="VD: Nghị quyết 15/2025/NQ-HĐND"
               className="banking-input"
             />
           </div>
           <div>
-            <label className="banking-label">Phân loại</label>
+            <label htmlFor="pdf-filename" className="banking-label">
+              Tên tệp PDF *
+            </label>
+            <div className="flex gap-1.5">
+              <input
+                id="pdf-filename"
+                required
+                value={pdfFileName}
+                onChange={(e) => setPdfFileName(e.target.value)}
+                placeholder="NQ15_2025_KhanhHoa.pdf"
+                className="banking-input flex-1"
+              />
+              <label className="banking-btn-secondary !min-h-[40px] !px-2.5 cursor-pointer shrink-0">
+                <Upload className="h-3.5 w-3.5" />
+                <input
+                  type="file"
+                  accept=".pdf"
+                  onChange={handlePdfFilePick}
+                  className="hidden"
+                />
+              </label>
+            </div>
+          </div>
+          <div>
+            <label htmlFor="pdf-cat" className="banking-label">
+              Phân loại tài liệu
+            </label>
             <select
+              id="pdf-cat"
               value={pdfCategory}
               onChange={(e) =>
                 setPdfCategory(e.target.value as PdfReferenceDocument['documentCategory'])
@@ -964,196 +963,84 @@ export const DataManagementModule: React.FC = () => {
               <option value="bang_gia_nha_nuoc">Bảng giá đất Nhà nước</option>
               <option value="bao_cao_ecovis">Báo cáo ECOVIS</option>
               <option value="quy_dinh_he_so_k">Quy định Hệ số K</option>
-              <option value="khac">Tài liệu tham chiếu khác</option>
+              <option value="khac">Tài liệu tham khảo khác</option>
             </select>
           </div>
           <div>
-            <label className="banking-label">Tổng số trang</label>
+            <label htmlFor="pdf-eff" className="banking-label">
+              Ngày hiệu lực / Ban hành
+            </label>
             <input
-              type="number"
-              min="1"
-              placeholder="VD: 120"
-              value={pdfPageCount}
-              onChange={(e) => setPdfPageCount(e.target.value)}
-              className="banking-input font-mono tabular-nums"
+              id="pdf-eff"
+              value={pdfEffectiveDate}
+              onChange={(e) => setPdfEffectiveDate(e.target.value)}
+              placeholder="01/01/2026"
+              className="banking-input"
             />
           </div>
           <div>
-            <label className="banking-label">Ngày ban hành / hiệu lực</label>
+            <label htmlFor="pdf-pages" className="banking-label">
+              Số trang
+            </label>
             <input
-              type="date"
-              value={pdfEffectiveDate}
-              onChange={(e) => setPdfEffectiveDate(e.target.value)}
+              id="pdf-pages"
+              type="number"
+              min={1}
+              max={50000}
+              value={pdfPageCount}
+              onChange={(e) => setPdfPageCount(e.target.value)}
+              placeholder="VD: 248"
               className="banking-input font-mono"
             />
           </div>
-        </div>
+          <div>
+            <label htmlFor="pdf-note" className="banking-label">
+              Ghi chú phụ lục
+            </label>
+            <input
+              id="pdf-note"
+              value={pdfAppendixNote}
+              onChange={(e) => setPdfAppendixNote(e.target.value)}
+              placeholder="VD: Trang 235–241 Khánh Sơn"
+              className="banking-input"
+            />
+          </div>
+          <div className="sm:col-span-3 flex justify-end">
+            <button type="submit" disabled={savingPdf} className="banking-btn-primary">
+              {savingPdf && <Loader2 className="h-4 w-4 animate-spin" />}
+              Lưu danh mục tài liệu PDF
+            </button>
+          </div>
+        </form>
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <input
-            type="text"
-            placeholder="Ghi chú phụ lục / phạm vi áp dụng..."
-            value={pdfAppendixNote}
-            onChange={(e) => setPdfAppendixNote(e.target.value)}
-            className="banking-input flex-1"
-          />
-          <input
-            ref={pdfInputRef}
-            type="file"
-            accept="application/pdf,.pdf"
-            onChange={(e) => handlePdfSelected(e.target.files?.[0] ?? null)}
-            className="hidden"
-          />
-          <button
-            type="button"
-            onClick={() => pdfInputRef.current?.click()}
-            className="banking-btn-secondary whitespace-nowrap shrink-0"
-          >
-            <Upload className="h-4 w-4 text-[#9D1D26]" />
-            Tải lên tài liệu PDF
-          </button>
-        </div>
-
-        {pdfError && <div className="text-[13px] font-medium text-[#9D1D26]">{pdfError}</div>}
-
-        {pdfDocuments.length > 0 && (
-          <div className="divide-y divide-[#E2E5E9] border-t border-[#E2E5E9] pt-2">
-            {pdfDocuments.map((doc) => (
-              <div key={doc.id} className="py-3.5 flex flex-wrap items-center justify-between gap-3 text-[13px]">
-                <div className="flex items-start gap-2.5">
-                  <FileText className="mt-0.5 h-4 w-4 text-[#9D1D26] shrink-0" />
-                  <div>
-                    <div className="font-semibold text-[#1F2429]">{doc.documentTitle}</div>
-                    <div className="text-xs text-[#6B7280] mt-0.5">
-                      Tệp: {doc.fileName} · {formatBytes(doc.fileSizeBytes)}
-                      {doc.pageCount ? ` · ${doc.pageCount} trang` : ''}
-                      {doc.effectiveDate ? ` · Hiệu lực: ${doc.effectiveDate}` : ''}
-                      {' · '}Tải lên: {formatDateTimeVi(doc.uploadedAt)}
-                    </div>
-                    {doc.appendixNote && (
-                      <div className="text-[#4B5563] mt-0.5">Ghi chú: {doc.appendixNote}</div>
-                    )}
+        {(overview?.pdfDocuments.length ?? 0) > 0 && (
+          <div className="divide-y divide-[#E2E5E9] rounded-md border border-[#E2E5E9]">
+            {overview!.pdfDocuments.map((pdf) => (
+              <div
+                key={pdf.id}
+                className="p-3 bg-white flex items-center justify-between gap-3 text-xs"
+              >
+                <div className="min-w-0 space-y-0.5">
+                  <div className="font-semibold text-[#1F2429] truncate">{pdf.documentTitle}</div>
+                  <div className="text-[#6B7280] flex flex-wrap gap-x-3">
+                    <span className="font-mono">{pdf.fileName}</span>
+                    {pdf.effectiveDate && <span>Hiệu lực: {pdf.effectiveDate}</span>}
+                    {pdf.pageCount && <span>{pdf.pageCount} trang</span>}
+                    {pdf.appendixNote && <span>{pdf.appendixNote}</span>}
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  {doc.sessionObjectUrl && (
-                    <a
-                      href={doc.sessionObjectUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 font-semibold text-[#9D1D26] hover:underline"
-                    >
-                      Mở xem PDF <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => void handleRemovePdf(doc.id)}
-                    aria-label="Xóa tài liệu PDF"
-                    className="inline-flex h-8 w-8 items-center justify-center rounded-md text-[#6B7280] hover:bg-[#FDF2F3] hover:text-[#9D1D26] cursor-pointer"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleDeletePdf(pdf.id)}
+                  className="text-[#9D1D26] hover:bg-[#FDF2F3] p-2 rounded cursor-pointer shrink-0"
+                  title="Xóa mục tài liệu"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
               </div>
             ))}
           </div>
         )}
-      </section>
-
-      {/* Section 3: Server Version History (Never Silently Overwrites) */}
-      <section className="banking-card overflow-hidden">
-        <div className="border-b border-[#E2E5E9] bg-[#F8F9FA] px-5 sm:px-6 py-4 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5">
-            <History className="h-4 w-4 text-[#9D1D26] shrink-0" />
-            <div>
-              <h3 className="banking-section-title">
-                3. Lịch sử phiên bản bộ dữ liệu trên máy chủ
-              </h3>
-              <p className="mt-0.5 text-[13px] text-[#4B5563]">
-                Mỗi đợt nạp dữ liệu là một phiên bản bất biến. Quản trị viên có thể khôi phục bất kỳ phiên bản cũ nào hoặc xuất JSON để đối chiếu/sao lưu.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-[13px]">
-            <thead>
-              <tr className="border-b border-[#E2E5E9] bg-[#F8F9FA] font-semibold text-[#1F2429]">
-                <th className="px-5 py-3">Nhóm dữ liệu</th>
-                <th className="px-4 py-3">Phiên bản & Tài liệu nguồn</th>
-                <th className="px-4 py-3 text-right">Số dòng / GPS</th>
-                <th className="px-4 py-3">Thời điểm nhập</th>
-                <th className="px-4 py-3">Trạng thái</th>
-                <th className="px-5 py-3 text-right">Thao tác</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#E2E5E9]">
-              {displayedVersions.length === 0 ? (
-                <tr>
-                  <td colSpan={6} className="px-6 py-8 text-center text-[#6B7280]">
-                    Chưa có phiên bản dữ liệu thật nào được lưu trên máy chủ.
-                  </td>
-                </tr>
-              ) : (
-                displayedVersions.map((ver) => (
-                  <tr key={ver.versionId} className="hover:bg-[#F9FAFB]">
-                    <td className="px-5 py-3.5 font-medium text-[#1F2429]">
-                      {DATASET_LABELS[ver.datasetKind]}
-                    </td>
-                    <td className="px-4 py-3.5">
-                      <div className="font-semibold text-[#1F2429]">{ver.versionLabel}</div>
-                      <div className="text-xs text-[#6B7280] mt-0.5">
-                        {ver.sourceDocumentName} · Tệp: {ver.sourceFileName}
-                        {ver.importedByEmail ? ` · Bởi: ${ver.importedByEmail}` : ''}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3.5 text-right font-mono tabular-nums text-[#1F2429]">
-                      <div className="font-semibold">{ver.rowCount.toLocaleString('vi-VN')}</div>
-                      {(ver.spatialRecordsCount ?? 0) > 0 && (
-                        <div className="text-xs text-[#0B5D3F]">
-                          {ver.spatialRecordsCount} GPS
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-4 py-3.5 font-mono tabular-nums text-[#4B5563]">
-                      {formatDateTimeVi(ver.importedAt)}
-                    </td>
-                    <td className="px-4 py-3.5 font-semibold">
-                      {ver.isActive ? (
-                        <span className="text-[#0B5D3F]">Đang áp dụng</span>
-                      ) : (
-                        <span className="text-[#6B7280]">Bản lưu trữ</span>
-                      )}
-                    </td>
-                    <td className="px-5 py-3.5 text-right">
-                      <div className="inline-flex items-center gap-3">
-                        {!ver.isActive && (
-                          <button
-                            type="button"
-                            disabled={actionBusy}
-                            onClick={() => void handleActivateVersion(ver.datasetKind, ver.versionId)}
-                            className="font-semibold text-[#9D1D26] hover:text-[#7F151D] hover:underline disabled:opacity-50 cursor-pointer"
-                          >
-                            Khôi phục bản này
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => void handleExportVersionJson(ver.datasetKind, ver.versionId)}
-                          className="font-medium text-[#4B5563] hover:text-[#1F2429] hover:underline cursor-pointer"
-                        >
-                          Xuất JSON
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
       </section>
     </div>
   );

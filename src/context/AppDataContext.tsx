@@ -26,7 +26,10 @@ import {
   isStateRecordDemo,
   validateAttachToDossier,
 } from '../utils/dossierIntegrity';
-import { buildApiUrl } from '../utils/apiClient';
+import {
+  fetchPublicActiveDatasetsSnapshot,
+  type ActiveVersionPointerDoc,
+} from '../services/firestoreDatasetStore';
 import { detectDuplicateMarketListings } from '../utils/formatters';
 
 const STORAGE_KEY_DATASETS = 'khanh_hoa_land_real_datasets_v1';
@@ -50,7 +53,7 @@ interface RealDatasetsState {
 }
 
 export interface ServerActiveDatasetsSnapshot {
-  storageBackend: 'server_json_file';
+  storageBackend: 'cloud_firestore' | 'server_json_file';
   updatedAt: string;
   active: {
     statePrice: { meta: DatasetVersionMetadata | null; records: StateLandPriceRecord[] };
@@ -170,8 +173,11 @@ interface AppDataContextValue {
     records: StateLandPriceRecord[] | EcovisRecord[] | KFactorRuleRecord[] | MarketListingRecord[]
   ) => void;
   activateDatasetVersion: (kind: DatasetKind, versionId: string) => void;
-  // M1.2 Server Dataset Synchronization (public read + admin write sync)
+  // Cloud Firestore active dataset synchronization (public read + admin write sync)
   serverDatasetStatus: 'loading' | 'synced' | 'offline';
+  firestoreError: string | null;
+  activeVersionPointers: Record<DatasetKind, ActiveVersionPointerDoc | null>;
+  hasLargeDatasetRequiringTargetedQuery: Record<DatasetKind, boolean>;
   serverUpdatedAt: string | null;
   applyServerActiveSnapshot: (snapshot: ServerActiveDatasetsSnapshot) => void;
   refreshServerDatasets: () => Promise<void>;
@@ -235,7 +241,7 @@ function loadFromStorage<T>(key: string, fallback: T): T {
 }
 
 export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [activeModule, setActiveModule] = useState<ModuleId>('home');
+  const [activeModule, setActiveModule] = useState<ModuleId>('quick-lookup');
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
 
@@ -243,11 +249,28 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
     loadFromStorage<RealDatasetsState>(STORAGE_KEY_DATASETS, createInitialRealDatasets())
   );
 
-  // M1.2 Server-persisted active datasets (public read-only sync via /api/datasets/active)
+  // Cloud Firestore persisted active datasets (public read-only sync directly via Firestore Web SDK)
   const [serverSnapshot, setServerSnapshot] = useState<ServerActiveDatasetsSnapshot | null>(null);
   const [serverDatasetStatus, setServerDatasetStatus] = useState<'loading' | 'synced' | 'offline'>('loading');
+  const [firestoreError, setFirestoreError] = useState<string | null>(null);
+  const [activeVersionPointers, setActiveVersionPointers] = useState<
+    Record<DatasetKind, ActiveVersionPointerDoc | null>
+  >({
+    state_price: null,
+    ecovis: null,
+    k_factor_rules: null,
+    market_survey: null,
+  });
+  const [hasLargeDatasetRequiringTargetedQuery, setHasLargeDatasetRequiringTargetedQuery] = useState<
+    Record<DatasetKind, boolean>
+  >({
+    state_price: false,
+    ecovis: false,
+    k_factor_rules: false,
+    market_survey: false,
+  });
 
-  // Isolated in-memory demo market listings (empty after demoData.ts removal)
+  // Isolated in-memory demo market listings (empty — never populated with fake data)
   const [demoMarketListings, setDemoMarketListings] = useState<MarketListingRecord[]>(() =>
     detectDuplicateMarketListings([])
   );
@@ -259,24 +282,64 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const applyServerActiveSnapshot = useCallback((snapshot: ServerActiveDatasetsSnapshot) => {
     setServerSnapshot(snapshot);
     setServerDatasetStatus('synced');
+    setFirestoreError(null);
   }, []);
 
   const refreshServerDatasets = useCallback(async () => {
+    setServerDatasetStatus('loading');
+    setFirestoreError(null);
     try {
-      const response = await fetch(buildApiUrl('/api/datasets/active'), { cache: 'no-store' });
-      if (!response.ok) {
-        setServerDatasetStatus('offline');
-        return;
-      }
-      const data = (await response.json()) as ServerActiveDatasetsSnapshot;
-      if (data && data.active) {
-        setServerSnapshot(data);
-        setServerDatasetStatus('synced');
-      } else {
-        setServerDatasetStatus('offline');
-      }
-    } catch {
+      const snap = await fetchPublicActiveDatasetsSnapshot();
+      const pointerToMeta = (ptr: ActiveVersionPointerDoc | null): DatasetVersionMetadata | null =>
+        ptr
+          ? {
+              versionId: ptr.activeVersionId,
+              datasetKind: ptr.datasetKind,
+              versionLabel: ptr.versionLabel,
+              sourceDocumentName: ptr.sourceDocumentName,
+              sourceFileName: ptr.sourceFileName,
+              effectiveDate: ptr.effectiveDate,
+              importedAt: ptr.importedAt,
+              rowCount: ptr.rowCount,
+              spatialRecordsCount: ptr.spatialRecordsCount,
+              notes: ptr.notes,
+              isActive: true,
+            }
+          : null;
+
+      setActiveVersionPointers(snap.activePointers);
+      setHasLargeDatasetRequiringTargetedQuery(snap.hasLargeDatasetRequiringTargetedQuery);
+      setServerSnapshot({
+        storageBackend: 'cloud_firestore',
+        updatedAt: new Date().toISOString(),
+        active: {
+          statePrice: {
+            meta: pointerToMeta(snap.activePointers.state_price),
+            records: snap.statePriceRecords,
+          },
+          ecovis: {
+            meta: pointerToMeta(snap.activePointers.ecovis),
+            records: snap.ecovisRecords,
+          },
+          kFactorRules: {
+            meta: pointerToMeta(snap.activePointers.k_factor_rules),
+            records: snap.kFactorRules,
+          },
+          marketSurvey: {
+            meta: pointerToMeta(snap.activePointers.market_survey),
+            records: snap.marketListings,
+          },
+        },
+        pdfDocuments: snap.pdfDocuments,
+      });
+      setServerDatasetStatus('synced');
+    } catch (error) {
       setServerDatasetStatus('offline');
+      setFirestoreError(
+        error instanceof Error
+          ? error.message
+          : 'Không thể kết nối máy chủ Cloud Firestore. Vui lòng kiểm tra cấu hình Firebase.'
+      );
     }
   }, []);
 
@@ -961,6 +1024,9 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
         commitDatasetVersion,
         activateDatasetVersion,
         serverDatasetStatus,
+        firestoreError,
+        activeVersionPointers,
+        hasLargeDatasetRequiringTargetedQuery,
         serverUpdatedAt: serverSnapshot?.updatedAt ?? null,
         applyServerActiveSnapshot,
         refreshServerDatasets,

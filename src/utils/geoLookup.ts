@@ -17,6 +17,7 @@ export const KHANH_HOA_GEO_BOUNDS = {
 export const EXIF_OCR_CONSISTENT_MAX_M = 30;
 export const EXIF_OCR_CONFLICT_THRESHOLD_M = 150;
 export const EXACT_SPATIAL_RADIUS_M = 150;
+export const EMPTY_MARKET_DATA_MESSAGE = 'Chưa có số liệu về giá trị thị trường vị trí đất.';
 
 export interface CoordinateValidationReport {
   status: 'valid_khanh_hoa' | 'outside_khanh_hoa' | 'invalid' | 'missing';
@@ -862,16 +863,12 @@ export function runUnifiedLandPriceLookup(params: {
 
   let marketMissingReason: string | null = null;
   if (activeMarketNonExcluded.length === 0) {
-    marketMissingReason =
-      'Chưa có tin rao bán thị trường hợp lệ trong kho dữ liệu. Cán bộ có thể nhập thêm tại mục Khảo sát thị trường hoặc nạp qua /admin.';
-    missingDataNotices.push('Chưa có dữ liệu rao bán thị trường tham khảo hợp lệ.');
+    marketMissingReason = EMPTY_MARKET_DATA_MESSAGE;
+    missingDataNotices.push(EMPTY_MARKET_DATA_MESSAGE);
   } else if (marketExact.length === 0 && marketNearby.length === 0 && (hasQueryCoords || hasQueryLocationText)) {
-    marketMissingReason =
-      marketSpatialCount === 0 && hasQueryCoords && !hasQueryLocationText
-        ? 'Các tin rao thị trường hiện tại chưa có tọa độ GPS — cần có Tên đường hoặc Xã/Phường để đối chiếu.'
-        : 'Không tìm thấy tin rao bán thị trường nào khớp vị trí hoặc khu vực lân cận.';
+    marketMissingReason = EMPTY_MARKET_DATA_MESSAGE;
   } else if (marketExact.length === 0 && marketNearby.length > 0) {
-    marketMissingReason = `Không có tin rao bán khớp đúng tuyến đường/vị trí; chỉ có ${marketNearby.length} tin rao tham chiếu lân cận.`;
+    marketMissingReason = `${EMPTY_MARKET_DATA_MESSAGE} Chỉ có ${marketNearby.length} tin rao bán tham chiếu khu vực lân cận (không phải giá giao dịch thành công).`;
   }
 
   if (

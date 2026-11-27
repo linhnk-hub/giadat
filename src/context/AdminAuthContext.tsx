@@ -6,9 +6,9 @@ import {
   signOut,
   type User,
 } from 'firebase/auth';
-import { auth, googleProvider } from '../firebase';
+import { auth, FIXED_ADMIN_EMAIL, firestoreDatabaseId, googleProvider } from '../firebase';
+import { verifyAdminFirestoreAccess } from '../services/firestoreDatasetStore';
 import { createVerificationCoordinator } from '../utils/adminVerifyCoordinator';
-import { buildApiUrl } from '../utils/apiClient';
 
 export type AdminAuthStatus =
   | 'loading'
@@ -24,6 +24,7 @@ export interface VerifiedAdminSession {
   emailVerified: boolean;
   authMethod: string;
   serverVerifiedAt: string;
+  databaseId: string;
 }
 
 interface AdminAuthContextValue {
@@ -40,7 +41,7 @@ interface AdminAuthContextValue {
   clearError: () => void;
 }
 
-interface BackendVerifyOutcome {
+interface AdminVerifyOutcome {
   status: AdminAuthStatus;
   session: VerifiedAdminSession | null;
   errorMessage: string | null;
@@ -71,7 +72,9 @@ function mapFirebaseAuthError(error: unknown): string {
     case 'auth/popup-blocked':
       return 'Trình duyệt đã chặn cửa sổ đăng nhập Google. Vui lòng cho phép popup cho trang này và thử lại.';
     case 'auth/operation-not-allowed':
-      return 'Phương thức đăng nhập Email/Mật khẩu chưa được bật trên Firebase Console. Vui lòng dùng Đăng nhập bằng Google hoặc bật Email/Password trong Firebase Authentication.';
+      return 'Phương thức đăng nhập Email/Mật khẩu chưa được bật trên Firebase Console. Vui lòng dùng Đăng nhập bằng Google.';
+    case 'auth/unauthorized-domain':
+      return 'Tên miền hiện tại chưa được thêm vào Authorized Domains trên Firebase Authentication.';
     case 'auth/network-request-failed':
       return 'Không thể kết nối tới dịch vụ xác thực Firebase. Vui lòng kiểm tra kết nối mạng.';
     default:
@@ -86,14 +89,12 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState<boolean>(false);
 
-  // Single-flight coordinator: prevents overlapping duplicate GET /api/admin/session calls
-  // without caching completed results or storing any admin state in localStorage.
-  const coordinatorRef = useRef(createVerificationCoordinator<BackendVerifyOutcome>());
-  // Tracks an active interactive sign-in (Google/Email) so onAuthStateChanged hands off
-  // backend verification to the sign-in flow instead of triggering a second concurrent fetch.
+  // Single-flight coordinator prevents duplicate verification probes without caching
+  // completed admin status or ever writing admin authorization state to localStorage.
+  const coordinatorRef = useRef(createVerificationCoordinator<AdminVerifyOutcome>());
   const interactiveSignInRef = useRef<boolean>(false);
 
-  const verifyWithBackend = useCallback(
+  const verifyWithFirebaseAndRules = useCallback(
     async (user: User | null, forceRefreshToken = false): Promise<boolean> => {
       if (!user) {
         coordinatorRef.current.invalidate();
@@ -107,95 +108,82 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       const result = await coordinatorRef.current.run(
         user.uid,
         forceRefreshToken,
-        async (): Promise<BackendVerifyOutcome> => {
+        async (): Promise<AdminVerifyOutcome> => {
           try {
-            const idToken = await user.getIdToken(forceRefreshToken);
-            const response = await fetch(buildApiUrl('/api/admin/session'), {
-              method: 'GET',
-              headers: {
-                Authorization: `Bearer ${idToken}`,
-              },
-              cache: 'no-store',
-            });
+            // 1. Refresh Firebase ID token & check A1 Single Fixed Admin Email + emailVerified
+            await user.getIdToken(forceRefreshToken);
+            const normalizedEmail = (user.email ?? '').trim().toLowerCase();
 
-            const payload = (await response.json().catch(() => ({}))) as {
-              authenticated?: boolean;
-              isAdmin?: boolean;
-              code?: string;
-              user?: {
-                uid?: string;
-                email?: string | null;
-                emailVerified?: boolean;
-              };
-              authMethod?: string;
-              serverVerifiedAt?: string;
-              error?: string;
-            };
-
-            if (
-              response.ok &&
-              payload.authenticated === true &&
-              payload.isAdmin === true &&
-              payload.user?.uid
-            ) {
-              return {
-                status: 'authorized',
-                session: {
-                  uid: payload.user.uid,
-                  email: payload.user.email ?? user.email ?? null,
-                  emailVerified: payload.user.emailVerified === true,
-                  authMethod: payload.authMethod ?? 'single_fixed_admin_email',
-                  serverVerifiedAt: payload.serverVerifiedAt ?? new Date().toISOString(),
-                },
-                errorMessage: null,
-                authorized: true,
-              };
-            }
-
-            if (response.status === 403) {
+            if (!normalizedEmail || normalizedEmail !== FIXED_ADMIN_EMAIL) {
               return {
                 status: 'access_denied',
                 session: null,
                 errorMessage:
-                  payload.error ||
-                  'Tài khoản đã xác thực nhưng không có quyền Quản trị viên (Access Denied).',
+                  'Tài khoản đã xác thực nhưng không phải Email Quản trị cố định được phân quyền (Access Denied).',
                 authorized: false,
               };
             }
 
-            if (response.status === 401) {
+            if (user.emailVerified !== true) {
               return {
-                status: 'unauthenticated',
+                status: 'access_denied',
                 session: null,
                 errorMessage:
-                  payload.error ||
-                  'Phiên xác thực không hợp lệ hoặc đã hết hạn. Vui lòng đăng nhập lại.',
+                  'Tài khoản quản trị bắt buộc phải có email đã xác minh (email_verified = true). Vui lòng đăng nhập bằng Google.',
                 authorized: false,
               };
             }
 
-            // Fail closed on 503 (Firestore unavailable / rules not ready) or any unexpected server response
+            // 2. Verify live Cloud Firestore Security Rules grant Admin privileges on database "giadat"
+            const rulesProbe = await verifyAdminFirestoreAccess();
+            if (!rulesProbe.ok) {
+              if (rulesProbe.reason === 'permission_denied') {
+                return {
+                  status: 'access_denied',
+                  session: null,
+                  errorMessage:
+                    rulesProbe.message ||
+                    'Cloud Firestore Security Rules từ chối quyền quản trị (403).',
+                  authorized: false,
+                };
+              }
+              return {
+                status: 'error',
+                session: null,
+                errorMessage:
+                  rulesProbe.message ||
+                  'Không thể xác minh quyền Quản trị với Cloud Firestore. Truy cập bị từ chối mặc định.',
+                authorized: false,
+              };
+            }
+
             return {
-              status: 'error',
-              session: null,
-              errorMessage:
-                payload.error ||
-                'Không thể xác minh quyền Quản trị viên với máy chủ. Truy cập bị từ chối mặc định.',
-              authorized: false,
+              status: 'authorized',
+              session: {
+                uid: user.uid,
+                email: user.email,
+                emailVerified: true,
+                authMethod: 'firebase_auth_firestore_rules_a1',
+                serverVerifiedAt: new Date().toISOString(),
+                databaseId: firestoreDatabaseId,
+              },
+              errorMessage: null,
+              authorized: true,
             };
-          } catch {
+          } catch (error) {
             return {
               status: 'error',
               session: null,
               errorMessage:
-                'Không kết nối được máy chủ xác minh quyền Quản trị viên. Vui lòng thử lại.',
+                error instanceof Error
+                  ? error.message
+                  : 'Không thể xác minh phiên quản trị với Firebase. Truy cập bị từ chối mặc định.',
               authorized: false,
             };
           }
         }
       );
 
-      // Ignore stale responses superseded by a newer verification or sign-out
       if (!result.applied) {
         return false;
       }
@@ -219,21 +207,18 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setStatus('unauthenticated');
         return;
       }
-      // During interactive sign-in (Google/Email), the sign-in handler itself performs
-      // the single authoritative verifyWithBackend(credential.user, true) call.
       if (interactiveSignInRef.current) {
         setStatus('verifying');
         return;
       }
-      // On F5 / page reload / session restore, always verify live against backend
-      void verifyWithBackend(user, false);
+      void verifyWithFirebaseAndRules(user, false);
     });
 
     return () => {
       active = false;
       unsubscribe();
     };
-  }, [verifyWithBackend]);
+  }, [verifyWithFirebaseAndRules]);
 
   const signInWithGoogle = useCallback(async () => {
     setIsBusy(true);
@@ -242,7 +227,7 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     try {
       const credential = await signInWithPopup(auth, googleProvider);
       setFirebaseUser(credential.user);
-      await verifyWithBackend(credential.user, true);
+      await verifyWithFirebaseAndRules(credential.user, true);
     } catch (error) {
       setErrorMessage(mapFirebaseAuthError(error));
       if (!auth.currentUser) {
@@ -252,7 +237,7 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       interactiveSignInRef.current = false;
       setIsBusy(false);
     }
-  }, [verifyWithBackend]);
+  }, [verifyWithFirebaseAndRules]);
 
   const signInWithEmail = useCallback(
     async (email: string, password: string) => {
@@ -268,7 +253,7 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       try {
         const credential = await signInWithEmailAndPassword(auth, trimmedEmail, password);
         setFirebaseUser(credential.user);
-        await verifyWithBackend(credential.user, true);
+        await verifyWithFirebaseAndRules(credential.user, true);
       } catch (error) {
         setErrorMessage(mapFirebaseAuthError(error));
         if (!auth.currentUser) {
@@ -279,7 +264,7 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setIsBusy(false);
       }
     },
-    [verifyWithBackend]
+    [verifyWithFirebaseAndRules]
   );
 
   const signOutAdmin = useCallback(async () => {
@@ -308,9 +293,9 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         setStatus('unauthenticated');
         return false;
       }
-      return verifyWithBackend(currentUser, forceRefreshToken);
+      return verifyWithFirebaseAndRules(currentUser, forceRefreshToken);
     },
-    [verifyWithBackend]
+    [verifyWithFirebaseAndRules]
   );
 
   const getAdminAuthHeaders = useCallback(

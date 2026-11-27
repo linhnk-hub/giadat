@@ -1,13 +1,51 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  type Firestore,
+} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
+
+export const FIXED_ADMIN_EMAIL = 'linhnk2013@gmail.com';
+export const DEFAULT_FIRESTORE_DATABASE_ID = 'giadat';
+
+const envDbId =
+  typeof import.meta !== 'undefined' &&
+  import.meta.env &&
+  typeof import.meta.env.VITE_FIRESTORE_DATABASE_ID === 'string'
+    ? import.meta.env.VITE_FIRESTORE_DATABASE_ID.trim()
+    : '';
+
+export const firestoreDatabaseId =
+  envDbId || firebaseConfig.firestoreDatabaseId || DEFAULT_FIRESTORE_DATABASE_ID;
+
+export const firebaseProjectId = firebaseConfig.projectId;
+export const firebaseAuthDomain = firebaseConfig.authDomain;
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
-export const db = firebaseConfig.firestoreDatabaseId
-  ? getFirestore(app, firebaseConfig.firestoreDatabaseId)
-  : getFirestore(app);
+function createFirestoreInstance(): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firestoreDatabaseId);
+  }
+}
+
+export const db: Firestore = createFirestoreInstance();
 
 export const auth = getAuth(app);
 
@@ -15,8 +53,6 @@ export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({
   prompt: 'select_account',
 });
-
-export const firebaseProjectId = firebaseConfig.projectId;
 
 export enum OperationType {
   CREATE = 'create',
@@ -66,5 +102,21 @@ export function handleFirestoreError(
     operationType,
     path,
   };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
+}
+
+export async function verifyFirestoreConnection(): Promise<{
+  ok: boolean;
+  offline: boolean;
+  message?: string;
+}> {
+  try {
+    await getDocFromServer(doc(db, 'dataset_categories', 'state_price'));
+    return { ok: true, offline: false };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const offline = message.includes('the client is offline');
+    return { ok: false, offline, message };
+  }
 }

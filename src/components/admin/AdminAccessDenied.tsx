@@ -19,7 +19,7 @@ export const AdminAccessDenied: React.FC = () => {
               <h1 className="text-lg font-bold text-[#1F2429]">
                 Không có quyền Quản trị (403)
               </h1>
-              <p className="text-[13px] text-[#6B7280]">Access Denied · Xác minh máy chủ</p>
+              <p className="text-[13px] text-[#6B7280]">Access Denied · Firebase Auth & Firestore Rules</p>
             </div>
           </div>
 
@@ -31,7 +31,7 @@ export const AdminAccessDenied: React.FC = () => {
               </span>{' '}
               đã xác thực thành công với Firebase Authentication, nhưng{' '}
               <strong className="text-[#1F2429]">
-                không nằm trong danh sách Quản trị viên được máy chủ cấp quyền
+                không phải Email Quản trị được Cloud Firestore Security Rules cấp quyền
               </strong>
               .
             </p>

@@ -49,7 +49,7 @@ export const AdminLoginPage: React.FC = () => {
 
             <div className="p-6 sm:p-7">
               <p className="text-sm leading-relaxed text-[#4B5563]">
-                Khu vực dành riêng cho Quản trị viên được cấp quyền qua Firebase Authentication và xác minh tại máy chủ. Hệ thống không hỗ trợ tự đăng ký tài khoản quản trị.
+                Khu vực dành riêng cho Quản trị viên được cấp quyền qua Firebase Authentication (Google Sign-In) và kiểm soát trực tiếp bởi Cloud Firestore Security Rules. Hệ thống không hỗ trợ tự đăng ký tài khoản quản trị.
               </p>
 
               {errorMessage && (
@@ -164,7 +164,7 @@ export const AdminLoginPage: React.FC = () => {
               </div>
 
               <div className="mt-6 border-t border-[#E2E5E9] pt-4 text-xs leading-relaxed text-[#6B7280]">
-                Mọi quyền truy cập quản trị đều áp dụng nguyên tắc từ chối mặc định (deny-by-default) và xác minh chữ ký ID token trực tiếp trên máy chủ.
+                Mọi quyền ghi dữ liệu đều áp dụng nguyên tắc từ chối mặc định (deny-by-default) và xác minh trực tiếp bằng Cloud Firestore Security Rules (database <span className="font-mono text-[#1F2429]">giadat</span>).
               </div>
             </div>
           </div>

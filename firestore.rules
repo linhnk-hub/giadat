@@ -3,17 +3,51 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // 1. Global Safety Net — Deny-by-Default for all unmatched collections/documents
+    // =========================================================================
+    // 1. GLOBAL SAFETY NET — DENY-BY-DEFAULT FOR ALL UNMATCHED PATHS
+    // =========================================================================
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // 2. Reusable Security Primitives
+    // =========================================================================
+    // 2. REUSABLE SECURITY PRIMITIVES (A1 SINGLE FIXED ADMIN EMAIL)
+    // =========================================================================
     function isValidId(id) {
       return id is string
         && id.size() >= 1
         && id.size() <= 128
         && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidVersionId(id) {
+      return id is string
+        && id.size() >= 3
+        && id.size() <= 80
+        && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidDatasetKind(kind) {
+      return kind is string
+        && kind in ['state_price', 'ecovis', 'k_factor_rules', 'market_survey'];
+    }
+
+    function isValidNormalizedKey(val, maxLen) {
+      return val is string
+        && val.size() <= maxLen
+        && val.matches('^[a-z0-9_]*$');
+    }
+
+    function isValidNonEmptyString(val, maxLen) {
+      return val is string && val.size() >= 1 && val.size() <= maxLen;
+    }
+
+    function isValidOptionalString(val, maxLen) {
+      return val is string && val.size() <= maxLen;
+    }
+
+    function isValidPositiveNumber(val) {
+      return (val is int || val is float) && val > 0;
     }
 
     function incoming() {
@@ -34,186 +68,552 @@ service cloud.firestore {
         && request.auth.token.email_verified == true;
     }
 
-    // Strict one-time Bootstrap owner identity (ONLY for initial one-time bootstrap, NEVER grants isAdmin())
-    function isBootstrapOwnerIdentity() {
-      return isVerifiedEmail()
-        && request.auth.token.email.lower() == 'linhnk2013@gmail.com';
-    }
-
-    function isBootstrapNotInitialized() {
-      return !exists(/databases/$(database)/documents/adminSystem/bootstrap);
-    }
-
-    // D1 Single Source of Truth: Admin status comes EXCLUSIVELY from /admins/{request.auth.uid}
-    // Note: get() inside Security Rules bypasses match rules -> zero recursion with /admins/{adminUid} allow get.
-    // Accessing the same path within one evaluation is cached by Firestore Rules (1 document lookup).
+    // Single Fixed Admin Email (A1) — zero extra DB reads, strictly requires verified Google email
     function isAdmin() {
       return isVerifiedEmail()
         && isValidId(request.auth.uid)
-        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.uid == request.auth.uid
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true;
+        && request.auth.token.email.lower() == 'linhnk2013@gmail.com';
     }
 
-    // 3. Validation Blueprints (synchronized with firebase-blueprint.json)
-    function isValidAdminRegistryEntry(data, adminUid) {
-      return data.keys().hasAll(['uid', 'email', 'role', 'active', 'grantedByUid', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'active', 'grantedByUid', 'createdAt', 'updatedAt'])
-        && data.uid is string
-        && data.uid == adminUid
-        && isValidId(data.uid)
-        && data.email is string
-        && data.email.size() >= 3
-        && data.email.size() <= 254
-        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
-        && data.role == 'admin'
-        && data.active is bool
-        && data.grantedByUid is string
-        && data.grantedByUid == request.auth.uid
-        && isValidId(data.grantedByUid)
+    // =========================================================================
+    // 3. VALIDATION BLUEPRINTS (SYNCHRONIZED WITH firebase-blueprint.json)
+    // =========================================================================
+
+    function isValidDatasetCategory(data, datasetKind) {
+      return data.keys().hasAll(['datasetKind', 'displayName', 'description', 'enabled', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['datasetKind', 'displayName', 'description', 'enabled', 'createdAt', 'updatedAt'])
+        && isValidDatasetKind(data.datasetKind)
+        && data.datasetKind == datasetKind
+        && isValidNonEmptyString(data.displayName, 160)
+        && isValidOptionalString(data.description, 500)
+        && data.enabled is bool
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
-    function isValidBootstrapLock(data) {
-      return data.keys().hasAll(['initialized', 'bootstrapAdminUid', 'bootstrapAdminEmail', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['initialized', 'bootstrapAdminUid', 'bootstrapAdminEmail', 'createdAt', 'updatedAt'])
-        && data.initialized == true
-        && data.bootstrapAdminUid is string
-        && data.bootstrapAdminUid == request.auth.uid
-        && isValidId(data.bootstrapAdminUid)
-        && data.bootstrapAdminEmail is string
-        && data.bootstrapAdminEmail.size() >= 3
-        && data.bootstrapAdminEmail.size() <= 254
-        && data.bootstrapAdminEmail.lower() == 'linhnk2013@gmail.com'
+    function isValidActiveVersionPointer(data, datasetKind) {
+      return data.keys().hasAll([
+          'datasetKind', 'activeVersionId', 'versionLabel', 'sourceDocumentName',
+          'sourceFileName', 'effectiveDate', 'importedAt', 'rowCount',
+          'spatialRecordsCount', 'notes', 'lastEventId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'datasetKind', 'activeVersionId', 'versionLabel', 'sourceDocumentName',
+          'sourceFileName', 'effectiveDate', 'importedAt', 'rowCount',
+          'spatialRecordsCount', 'notes', 'lastEventId', 'createdAt', 'updatedAt'
+        ])
+        && isValidDatasetKind(data.datasetKind)
+        && data.datasetKind == datasetKind
+        && isValidVersionId(data.activeVersionId)
+        && isValidNonEmptyString(data.versionLabel, 240)
+        && isValidNonEmptyString(data.sourceDocumentName, 300)
+        && isValidNonEmptyString(data.sourceFileName, 260)
+        && isValidNonEmptyString(data.effectiveDate, 64)
+        && isValidNonEmptyString(data.importedAt, 64)
+        && data.rowCount is int
+        && data.rowCount >= 1
+        && data.rowCount <= 20000
+        && data.spatialRecordsCount is int
+        && data.spatialRecordsCount >= 0
+        && data.spatialRecordsCount <= data.rowCount
+        && isValidOptionalString(data.notes, 600)
+        && isValidId(data.lastEventId)
+        && data.lastEventId.size() >= 3
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
-    function isValidAdminSecurityConfig(data, configId) {
-      return data.keys().hasAll(['configKey', 'updatedByUid', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['configKey', 'description', 'updatedByUid', 'createdAt', 'updatedAt'])
-        && data.configKey is string
-        && data.configKey == configId
-        && data.configKey.size() >= 1
-        && data.configKey.size() <= 64
-        && data.configKey.matches('^[a-zA-Z0-9_\\-]+$')
-        && (!('description' in data) || (data.description is string && data.description.size() <= 500))
-        && data.updatedByUid is string
-        && data.updatedByUid == request.auth.uid
-        && isValidId(data.updatedByUid)
+    function isValidDatasetVersion(data, versionId) {
+      return data.keys().hasAll([
+          'versionId', 'datasetKind', 'commitState', 'versionLabel',
+          'sourceDocumentName', 'sourceFileName', 'effectiveDate', 'importedAt',
+          'expectedRowCount', 'verifiedRowCount', 'spatialRecordsCount',
+          'payloadChecksum', 'notes', 'importedByUid', 'importedByEmail',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'versionId', 'datasetKind', 'commitState', 'versionLabel',
+          'sourceDocumentName', 'sourceFileName', 'effectiveDate', 'importedAt',
+          'expectedRowCount', 'verifiedRowCount', 'spatialRecordsCount',
+          'payloadChecksum', 'notes', 'importedByUid', 'importedByEmail',
+          'createdAt', 'updatedAt', 'committedAt'
+        ])
+        && isValidVersionId(data.versionId)
+        && data.versionId == versionId
+        && isValidDatasetKind(data.datasetKind)
+        && data.commitState in ['staging', 'committed', 'aborted']
+        && isValidNonEmptyString(data.versionLabel, 240)
+        && isValidNonEmptyString(data.sourceDocumentName, 300)
+        && isValidNonEmptyString(data.sourceFileName, 260)
+        && isValidNonEmptyString(data.effectiveDate, 64)
+        && isValidNonEmptyString(data.importedAt, 64)
+        && data.expectedRowCount is int
+        && data.expectedRowCount >= 1
+        && data.expectedRowCount <= 20000
+        && data.verifiedRowCount is int
+        && data.verifiedRowCount >= 0
+        && data.verifiedRowCount <= data.expectedRowCount
+        && data.spatialRecordsCount is int
+        && data.spatialRecordsCount >= 0
+        && data.spatialRecordsCount <= data.expectedRowCount
+        && data.payloadChecksum is string
+        && data.payloadChecksum.size() == 64
+        && data.payloadChecksum.matches('^[a-f0-9]{64}$')
+        && isValidOptionalString(data.notes, 600)
+        && isValidId(data.importedByUid)
+        && data.importedByUid == request.auth.uid
+        && data.importedByEmail is string
+        && data.importedByEmail.size() >= 3
+        && data.importedByEmail.size() <= 254
+        && data.importedByEmail.lower() == 'linhnk2013@gmail.com'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (
+          (data.commitState == 'committed' && 'committedAt' in data && data.committedAt is timestamp && data.verifiedRowCount == data.expectedRowCount)
+          ||
+          (data.commitState != 'committed' && !('committedAt' in data))
+        );
+    }
+
+    function isValidStatePricePayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'legalDocumentName', 'wardCommune', 'districtCity', 'streetName',
+          'roadSegment', 'startPoint', 'endPoint', 'landType', 'position',
+          'unitPrice', 'unit', 'sourcePageOrAppendix', 'effectiveDate', 'importedAt'
+        ])
+        && p.keys().hasOnly([
+          'legalDocumentName', 'wardCommune', 'districtCity', 'streetName',
+          'roadSegment', 'startPoint', 'endPoint', 'landType', 'position',
+          'unitPrice', 'unit', 'sourcePageOrAppendix', 'effectiveDate', 'importedAt',
+          'coordinateNote'
+        ])
+        && isValidNonEmptyString(p.legalDocumentName, 300)
+        && isValidNonEmptyString(p.wardCommune, 160)
+        && isValidOptionalString(p.districtCity, 160)
+        && isValidNonEmptyString(p.streetName, 240)
+        && isValidOptionalString(p.roadSegment, 300)
+        && isValidOptionalString(p.startPoint, 200)
+        && isValidOptionalString(p.endPoint, 200)
+        && isValidNonEmptyString(p.landType, 160)
+        && isValidNonEmptyString(p.position, 160)
+        && isValidPositiveNumber(p.unitPrice)
+        && isValidNonEmptyString(p.unit, 40)
+        && isValidNonEmptyString(p.sourcePageOrAppendix, 200)
+        && isValidNonEmptyString(p.effectiveDate, 64)
+        && isValidNonEmptyString(p.importedAt, 64)
+        && (!('coordinateNote' in p) || isValidOptionalString(p.coordinateNote, 240));
+    }
+
+    function isValidEcovisPayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'wardCommune', 'districtCity', 'streetName', 'roadSegment',
+          'landType', 'position', 'surveyUnitPrice', 'unit',
+          'sourceDocument', 'appendixAndPage', 'surveyOrReportDate', 'importedAt'
+        ])
+        && p.keys().hasOnly([
+          'wardCommune', 'districtCity', 'streetName', 'roadSegment',
+          'landType', 'position', 'surveyUnitPrice', 'unit',
+          'sourceDocument', 'appendixAndPage', 'surveyOrReportDate', 'importedAt',
+          'coordinateNote'
+        ])
+        && isValidOptionalString(p.wardCommune, 160)
+        && isValidOptionalString(p.districtCity, 160)
+        && isValidNonEmptyString(p.streetName, 240)
+        && isValidOptionalString(p.roadSegment, 300)
+        && isValidNonEmptyString(p.landType, 160)
+        && isValidNonEmptyString(p.position, 160)
+        && isValidPositiveNumber(p.surveyUnitPrice)
+        && isValidNonEmptyString(p.unit, 40)
+        && isValidNonEmptyString(p.sourceDocument, 300)
+        && isValidNonEmptyString(p.appendixAndPage, 200)
+        && isValidNonEmptyString(p.surveyOrReportDate, 64)
+        && isValidNonEmptyString(p.importedAt, 64)
+        && (!('coordinateNote' in p) || isValidOptionalString(p.coordinateNote, 240));
+    }
+
+    function isValidKFactorPayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'factorName', 'factorValue', 'formula', 'applicableCondition',
+          'requiredInputFields', 'sourceDocument', 'sourcePage',
+          'effectiveDate', 'importedAt'
+        ])
+        && p.keys().hasOnly([
+          'factorName', 'factorValue', 'formula', 'applicableCondition',
+          'requiredInputFields', 'sourceDocument', 'sourcePage',
+          'effectiveDate', 'importedAt'
+        ])
+        && isValidNonEmptyString(p.factorName, 240)
+        && isValidPositiveNumber(p.factorValue)
+        && isValidNonEmptyString(p.formula, 300)
+        && isValidNonEmptyString(p.applicableCondition, 500)
+        && isValidOptionalString(p.requiredInputFields, 300)
+        && isValidNonEmptyString(p.sourceDocument, 300)
+        && isValidNonEmptyString(p.sourcePage, 200)
+        && isValidNonEmptyString(p.effectiveDate, 64)
+        && isValidNonEmptyString(p.importedAt, 64);
+    }
+
+    function isValidMarketSurveyPayload(p) {
+      return p is map
+        && p.keys().hasAll([
+          'sourceName', 'url', 'postedDate', 'address', 'wardCommune',
+          'areaSqm', 'askingPriceVnd', 'unitPricePerSqm', 'propertyType',
+          'locationInfo', 'verificationStatus', 'verificationNote',
+          'isDuplicate', 'createdAtIso'
+        ])
+        && p.keys().hasOnly([
+          'sourceName', 'url', 'postedDate', 'address', 'wardCommune',
+          'areaSqm', 'askingPriceVnd', 'unitPricePerSqm', 'propertyType',
+          'locationInfo', 'verificationStatus', 'verificationNote',
+          'isDuplicate', 'createdAtIso', 'coordinateNote'
+        ])
+        && isValidNonEmptyString(p.sourceName, 200)
+        && p.url is string
+        && p.url.size() <= 1000
+        && (p.url == '' || p.url.matches('^https?://.*$'))
+        && isValidNonEmptyString(p.postedDate, 64)
+        && isValidNonEmptyString(p.address, 360)
+        && isValidOptionalString(p.wardCommune, 160)
+        && isValidPositiveNumber(p.areaSqm)
+        && isValidPositiveNumber(p.askingPriceVnd)
+        && isValidPositiveNumber(p.unitPricePerSqm)
+        && isValidNonEmptyString(p.propertyType, 120)
+        && isValidOptionalString(p.locationInfo, 300)
+        && p.verificationStatus in ['chua_xac_minh', 'da_xac_minh_so_bo', 'loai_tru']
+        && isValidNonEmptyString(p.verificationNote, 400)
+        && p.isDuplicate is bool
+        && isValidNonEmptyString(p.createdAtIso, 64)
+        && (!('coordinateNote' in p) || isValidOptionalString(p.coordinateNote, 240));
+    }
+
+    function isValidCoordinatesBlock(data) {
+      return (
+        data.hasCoordinates == true
+        && 'latitude' in data
+        && 'longitude' in data
+        && 'geohash5' in data
+        && 'geohash6' in data
+        && (data.latitude is int || data.latitude is float)
+        && data.latitude >= -90
+        && data.latitude <= 90
+        && (data.longitude is int || data.longitude is float)
+        && data.longitude >= -180
+        && data.longitude <= 180
+        && data.geohash5 is string
+        && data.geohash5.size() == 5
+        && data.geohash5.matches('^[0-9b-hjkmnp-z]{5}$')
+        && data.geohash6 is string
+        && data.geohash6.size() == 6
+        && data.geohash6.matches('^[0-9b-hjkmnp-z]{6}$')
+        && data.geohash6[0:5] == data.geohash5
+      ) || (
+        data.hasCoordinates == false
+        && (!('latitude' in data) || data.latitude == null)
+        && (!('longitude' in data) || data.longitude == null)
+        && (!('geohash5' in data) || data.geohash5 == null)
+        && (!('geohash6' in data) || data.geohash6 == null)
+      );
+    }
+
+    function isValidDatasetRecord(data, recordId) {
+      return data.keys().hasAll([
+          'recordId', 'datasetKind', 'versionId', 'recordCode',
+          'visibility', 'isDemo', 'districtKey', 'wardKey', 'streetKey',
+          'hasCoordinates', 'payload', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'recordId', 'datasetKind', 'versionId', 'recordCode',
+          'visibility', 'isDemo', 'districtKey', 'wardKey', 'streetKey',
+          'hasCoordinates', 'latitude', 'longitude', 'geohash5', 'geohash6',
+          'payload', 'createdAt'
+        ])
+        && isValidId(data.recordId)
+        && data.recordId == recordId
+        && isValidDatasetKind(data.datasetKind)
+        && isValidVersionId(data.versionId)
+        && isValidNonEmptyString(data.recordCode, 120)
+        && data.visibility == 'public'
+        && data.isDemo == false
+        && isValidNormalizedKey(data.districtKey, 80)
+        && isValidNormalizedKey(data.wardKey, 80)
+        && isValidNormalizedKey(data.streetKey, 160)
+        && data.hasCoordinates is bool
+        && isValidCoordinatesBlock(data)
+        && data.createdAt is timestamp
+        && (
+          (data.datasetKind == 'state_price' && isValidStatePricePayload(data.payload))
+          || (data.datasetKind == 'ecovis' && isValidEcovisPayload(data.payload))
+          || (data.datasetKind == 'k_factor_rules' && isValidKFactorPayload(data.payload))
+          || (data.datasetKind == 'market_survey' && isValidMarketSurveyPayload(data.payload))
+        );
+    }
+
+    function isValidActivationEvent(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'datasetKind', 'action', 'fromVersionId',
+          'toVersionId', 'reason', 'actorUid', 'actorEmail', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'eventId', 'datasetKind', 'action', 'fromVersionId',
+          'toVersionId', 'reason', 'actorUid', 'actorEmail', 'createdAt'
+        ])
+        && isValidId(data.eventId)
+        && data.eventId.size() >= 3
+        && data.eventId == eventId
+        && isValidDatasetKind(data.datasetKind)
+        && data.action in ['activate', 'rollback']
+        && data.fromVersionId is string
+        && data.fromVersionId.size() <= 80
+        && (data.fromVersionId == '' || isValidVersionId(data.fromVersionId))
+        && isValidVersionId(data.toVersionId)
+        && (data.action != 'rollback' || (data.fromVersionId != '' && data.fromVersionId != data.toVersionId))
+        && isValidOptionalString(data.reason, 400)
+        && isValidId(data.actorUid)
+        && data.actorUid == request.auth.uid
+        && data.actorEmail is string
+        && data.actorEmail.size() >= 3
+        && data.actorEmail.size() <= 254
+        && data.actorEmail.lower() == 'linhnk2013@gmail.com'
+        && data.createdAt is timestamp;
+    }
+
+    function isValidPdfDocument(data, docId) {
+      return data.keys().hasAll([
+          'id', 'fileName', 'documentTitle', 'documentCategory',
+          'effectiveDate', 'appendixNote', 'fileSizeBytes',
+          'uploadedAt', 'visibility', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'fileName', 'documentTitle', 'documentCategory', 'pageCount',
+          'effectiveDate', 'appendixNote', 'fileSizeBytes',
+          'uploadedAt', 'visibility', 'createdAt', 'updatedAt'
+        ])
+        && isValidVersionId(data.id)
+        && data.id == docId
+        && isValidNonEmptyString(data.fileName, 260)
+        && isValidNonEmptyString(data.documentTitle, 300)
+        && data.documentCategory in ['bang_gia_nha_nuoc', 'bao_cao_ecovis', 'quy_dinh_he_so_k', 'khac']
+        && (!('pageCount' in data) || data.pageCount == null || (data.pageCount is int && data.pageCount >= 1 && data.pageCount <= 50000))
+        && isValidOptionalString(data.effectiveDate, 64)
+        && isValidOptionalString(data.appendixNote, 500)
+        && data.fileSizeBytes is int
+        && data.fileSizeBytes >= 0
+        && data.fileSizeBytes <= 524288000
+        && isValidNonEmptyString(data.uploadedAt, 64)
+        && data.visibility == 'public'
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
-    // 4. Authorized Admin Registry (/admins/{adminUid}) — Single Source of Truth (D1)
-    match /admins/{adminUid} {
-      // Short-circuit: caller reading their OWN document costs 0 get()/exists() calls and never invokes isAdmin().
-      // Existing verified Admin may also GET another admin document by exact UID.
-      allow get: if isVerifiedEmail()
-        && isValidId(adminUid)
-        && (request.auth.uid == adminUid || isAdmin());
+    // =========================================================================
+    // 4. COLLECTION RULES
+    // =========================================================================
 
-      // Never allow listing the entire admins collection.
+    // 4.1 Dataset Categories (/dataset_categories/{datasetKind}) — 4 fixed non-PII docs
+    match /dataset_categories/{datasetKind} {
+      allow get: if isValidDatasetKind(datasetKind);
       allow list: if false;
 
-      // Create: ONLY via (A) one-time atomic Bootstrap for own UID OR (B) active Admin adding ANOTHER UID.
-      allow create: if isVerifiedEmail()
-        && isValidId(adminUid)
-        && isValidAdminRegistryEntry(incoming(), adminUid)
+      allow create: if isAdmin()
+        && isValidDatasetKind(datasetKind)
+        && isValidDatasetCategory(incoming(), datasetKind)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidDatasetKind(datasetKind)
+        && isValidDatasetCategory(incoming(), datasetKind)
+        && incoming().datasetKind == existing().datasetKind
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'description', 'enabled', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    // 4.2 Active Version Pointers (/active_versions/{datasetKind}) — 4 fixed public non-PII docs
+    match /active_versions/{datasetKind} {
+      allow get: if isValidDatasetKind(datasetKind);
+      allow list: if false;
+
+      allow create: if isAdmin()
+        && isValidDatasetKind(datasetKind)
+        && isValidActiveVersionPointer(incoming(), datasetKind)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId))
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.datasetKind == datasetKind
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.commitState == 'committed'
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.verifiedRowCount == incoming().rowCount
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.spatialRecordsCount == incoming().spatialRecordsCount
+        && existsAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId))
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.datasetKind == datasetKind
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.action == 'activate'
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.fromVersionId == ''
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.toVersionId == incoming().activeVersionId;
+
+      allow update: if isAdmin()
+        && isValidDatasetKind(datasetKind)
+        && isValidActiveVersionPointer(incoming(), datasetKind)
+        && incoming().datasetKind == existing().datasetKind
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'activeVersionId', 'versionLabel', 'sourceDocumentName', 'sourceFileName',
+          'effectiveDate', 'importedAt', 'rowCount', 'spatialRecordsCount',
+          'notes', 'lastEventId', 'updatedAt'
+        ])
+        && existsAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId))
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.datasetKind == datasetKind
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.commitState == 'committed'
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.verifiedRowCount == incoming().rowCount
+        && getAfter(/databases/$(database)/documents/dataset_versions/$(incoming().activeVersionId)).data.spatialRecordsCount == incoming().spatialRecordsCount
+        && existsAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId))
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.datasetKind == datasetKind
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.fromVersionId == existing().activeVersionId
+        && getAfter(/databases/$(database)/documents/activation_history/$(incoming().lastEventId)).data.toVersionId == incoming().activeVersionId;
+
+      allow delete: if false;
+    }
+
+    // 4.3 Dataset Version Ledger (/dataset_versions/{versionId}) — Admin-only (PII isolated), terminal-locked, never deleted
+    match /dataset_versions/{versionId} {
+      allow get: if isAdmin() && isValidVersionId(versionId);
+      allow list: if isAdmin()
+        && request.query.limit is int
+        && request.query.limit >= 1
+        && request.query.limit <= 200;
+
+      // New versions MUST begin in 'staging' with verifiedRowCount == 0
+      allow create: if isAdmin()
+        && isValidVersionId(versionId)
+        && isValidDatasetVersion(incoming(), versionId)
+        && incoming().commitState == 'staging'
+        && incoming().verifiedRowCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      // Action-based update with strict Terminal State Locking: only 'staging' can transition
+      allow update: if isAdmin()
+        && isValidVersionId(versionId)
+        && isValidDatasetVersion(incoming(), versionId)
+        && existing().commitState == 'staging'
+        && incoming().versionId == existing().versionId
+        && incoming().datasetKind == existing().datasetKind
+        && incoming().expectedRowCount == existing().expectedRowCount
+        && incoming().payloadChecksum == existing().payloadChecksum
+        && incoming().importedByUid == existing().importedByUid
+        && incoming().importedByEmail == existing().importedByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
         && (
-          // (A) One-time atomic self-closing Bootstrap (strictly own UID, strictly before /adminSystem/bootstrap exists)
+          // Action A: Commit verified staging version
           (
-            isBootstrapOwnerIdentity()
-            && adminUid == request.auth.uid
-            && incoming().email.lower() == 'linhnk2013@gmail.com'
-            && incoming().active == true
-            && isBootstrapNotInitialized()
-            && existsAfter(/databases/$(database)/documents/adminSystem/bootstrap)
-            && getAfter(/databases/$(database)/documents/adminSystem/bootstrap).data.initialized == true
-            && getAfter(/databases/$(database)/documents/adminSystem/bootstrap).data.bootstrapAdminUid == request.auth.uid
+            incoming().commitState == 'committed'
+            && incoming().verifiedRowCount == existing().expectedRowCount
+            && incoming().committedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['commitState', 'verifiedRowCount', 'committedAt', 'updatedAt'])
           )
           ||
-          // (B) Active Admin granting privileges to a DIFFERENT UID
+          // Action B: Abort incomplete staging upload
           (
-            adminUid != request.auth.uid
-            && isAdmin()
+            incoming().commitState == 'aborted'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['commitState', 'updatedAt'])
           )
         );
 
-      // Update: Active Admin may ONLY update ANOTHER admin's status/metadata (never self-tamper UID/role/active).
-      allow update: if isVerifiedEmail()
-        && isValidId(adminUid)
-        && adminUid != request.auth.uid
-        && isValidAdminRegistryEntry(incoming(), adminUid)
-        && incoming().uid == existing().uid
-        && incoming().role == existing().role
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'active', 'grantedByUid', 'updatedAt'])
-        && isAdmin();
-
-      // Delete: Active Admin may ONLY delete ANOTHER admin record; self-deletion (and deleting the last admin) is impossible.
-      allow delete: if isVerifiedEmail()
-        && isValidId(adminUid)
-        && adminUid != request.auth.uid
-        && isAdmin();
+      allow delete: if false;
     }
 
-    // 5. Immutable One-Time Bootstrap Lock (/adminSystem/bootstrap)
-    match /adminSystem/{docId} {
-      // Only Bootstrap owner (to inspect lock status) or active Admin may GET the bootstrap lock document.
-      allow get: if docId == 'bootstrap'
-        && isVerifiedEmail()
-        && (isBootstrapOwnerIdentity() || isAdmin());
+    // 4.4 Dataset Records (/dataset_records/{recordId}) — Immutable non-PII land price records
+    match /dataset_records/{recordId} {
+      allow get: if isValidId(recordId)
+        && (
+          (existing().visibility == 'public' && existing().isDemo == false)
+          || isAdmin()
+        );
 
-      allow list: if false;
+      // Zero get()/exists() in list (Cost-Optimization Clause); public queries strictly bounded <= 500
+      allow list: if isAdmin()
+        || (
+          request.query.limit is int
+          && request.query.limit >= 1
+          && request.query.limit <= 500
+          && existing().visibility == 'public'
+          && existing().isDemo == false
+        );
 
-      // Created ONCE atomically alongside /admins/{bootstrapUid}; permanently sealed afterwards.
-      allow create: if docId == 'bootstrap'
-        && isBootstrapOwnerIdentity()
-        && isValidBootstrapLock(incoming())
+      // Master Gate: parent DatasetVersion MUST exist, match datasetKind, and still be in 'staging'
+      allow create: if isAdmin()
+        && isValidId(recordId)
+        && isValidDatasetRecord(incoming(), recordId)
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time
-        && isBootstrapNotInitialized()
-        && existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid))
-        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.uid == request.auth.uid
-        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'admin'
-        && getAfter(/databases/$(database)/documents/admins/$(request.auth.uid)).data.active == true;
+        && exists(/databases/$(database)/documents/dataset_versions/$(incoming().versionId))
+        && get(/databases/$(database)/documents/dataset_versions/$(incoming().versionId)).data.datasetKind == incoming().datasetKind
+        && get(/databases/$(database)/documents/dataset_versions/$(incoming().versionId)).data.commitState == 'staging';
 
-      // Immutable forever once created: cannot be modified or deleted by client.
       allow update: if false;
       allow delete: if false;
     }
 
-    // 6. Protected Admin Configuration (/adminConfig/{configId}) — reserved for M1.2+
-    match /adminConfig/{configId} {
-      allow get: if isVerifiedEmail()
-        && isValidId(configId)
-        && isAdmin();
+    // 4.5 Activation & Rollback Audit Log (/activation_history/{eventId}) — Admin-only, append-only immutable
+    match /activation_history/{eventId} {
+      allow get: if isAdmin() && isValidId(eventId);
+      allow list: if isAdmin()
+        && request.query.limit is int
+        && request.query.limit >= 1
+        && request.query.limit <= 200;
 
-      allow list: if false;
-
-      allow create: if isVerifiedEmail()
-        && isValidId(configId)
-        && isValidAdminSecurityConfig(incoming(), configId)
+      // Atomicity Guarantee: must pair with active_versions/{datasetKind} in the same batch
+      allow create: if isAdmin()
+        && isValidId(eventId)
+        && isValidActivationEvent(incoming(), eventId)
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time
-        && isAdmin();
+        && existsAfter(/databases/$(database)/documents/active_versions/$(incoming().datasetKind))
+        && getAfter(/databases/$(database)/documents/active_versions/$(incoming().datasetKind)).data.activeVersionId == incoming().toVersionId
+        && getAfter(/databases/$(database)/documents/active_versions/$(incoming().datasetKind)).data.lastEventId == eventId;
 
-      allow update: if isVerifiedEmail()
-        && isValidId(configId)
-        && isValidAdminSecurityConfig(incoming(), configId)
-        && incoming().configKey == existing().configKey
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // 4.6 PDF Reference Catalog (/pdf_documents/{docId}) — Public non-PII metadata, Admin CRUD
+    match /pdf_documents/{docId} {
+      allow get: if isValidVersionId(docId)
+        && (existing().visibility == 'public' || isAdmin());
+
+      allow list: if isAdmin()
+        || (
+          request.query.limit is int
+          && request.query.limit >= 1
+          && request.query.limit <= 100
+          && existing().visibility == 'public'
+        );
+
+      allow create: if isAdmin()
+        && isValidVersionId(docId)
+        && isValidPdfDocument(incoming(), docId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidVersionId(docId)
+        && isValidPdfDocument(incoming(), docId)
+        && incoming().id == existing().id
+        && incoming().fileName == existing().fileName
+        && incoming().fileSizeBytes == existing().fileSizeBytes
+        && incoming().uploadedAt == existing().uploadedAt
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['description', 'updatedByUid', 'updatedAt'])
-        && isAdmin();
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'documentTitle', 'documentCategory', 'pageCount',
+          'effectiveDate', 'appendixNote', 'visibility', 'updatedAt'
+        ]);
 
-      allow delete: if false;
+      allow delete: if isAdmin() && isValidVersionId(docId);
     }
   }
 }

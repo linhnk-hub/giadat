@@ -1,49 +1,34 @@
 {
   "entities": {
-    "AdminRegistryEntry": {
-      "title": "AdminRegistryEntry",
-      "description": "Single source of truth for administrative authorization (D1). Keyed by Firebase Auth UID. Both Backend and Firestore Security Rules verify uid, role == 'admin', and active == true.",
+    "DatasetCategory": {
+      "title": "DatasetCategory",
+      "description": "Registry metadata for each of the 4 official dataset categories (state_price, ecovis, k_factor_rules, market_survey). Contains zero PII.",
       "type": "object",
       "properties": {
-        "uid": {
+        "datasetKind": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "Firebase Authentication UID matching the document ID."
-        },
-        "email": {
-          "type": "string",
-          "format": "email",
-          "minLength": 3,
-          "maxLength": 254,
-          "description": "Verified administrator email address."
+          "enum": ["state_price", "ecovis", "k_factor_rules", "market_survey"],
+          "description": "Canonical dataset kind identifier matching the document ID."
         },
         "displayName": {
           "type": "string",
-          "maxLength": 120,
-          "description": "Optional administrator display name."
-        },
-        "role": {
-          "type": "string",
-          "enum": ["admin"],
-          "description": "Fixed administrative role marker."
-        },
-        "active": {
-          "type": "boolean",
-          "description": "Whether administrative privileges are currently active."
-        },
-        "grantedByUid": {
-          "type": "string",
           "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "UID of the administrator who granted this entry."
+          "maxLength": 160,
+          "description": "Vietnamese display name of the dataset category."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Concise operational description of the category."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether this dataset category is active for public lookup."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp when the entry was created (immutable)."
+          "description": "Server timestamp when the category entry was created (immutable)."
         },
         "updatedAt": {
           "type": "string",
@@ -51,67 +36,604 @@
           "description": "Server timestamp of the latest update."
         }
       },
-      "required": ["uid", "email", "role", "active", "grantedByUid", "createdAt", "updatedAt"]
+      "required": ["datasetKind", "displayName", "description", "enabled", "createdAt", "updatedAt"]
     },
-    "AdminBootstrapLock": {
-      "title": "AdminBootstrapLock",
-      "description": "Immutable one-time lock document created atomically with the first Bootstrap Admin document to permanently close the Bootstrap flow.",
+    "ActiveVersionPointer": {
+      "title": "ActiveVersionPointer",
+      "description": "Public non-PII pointer to the currently active committed version for a dataset kind. Synchronized atomically with dataset_versions and activation_history.",
       "type": "object",
       "properties": {
-        "initialized": {
-          "type": "boolean",
-          "description": "Always true once bootstrap initialization has completed."
+        "datasetKind": {
+          "type": "string",
+          "enum": ["state_price", "ecovis", "k_factor_rules", "market_survey"],
+          "description": "Canonical dataset kind matching the document ID."
         },
-        "bootstrapAdminUid": {
+        "activeVersionId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Committed versionId currently serving public lookups."
+        },
+        "versionLabel": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 240,
+          "description": "Human-readable version label displayed in provenance."
+        },
+        "sourceDocumentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Official legal document or source report title."
+        },
+        "sourceFileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 260,
+          "description": "Original imported filename."
+        },
+        "effectiveDate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Effective date or report date string."
+        },
+        "importedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO timestamp when this version was imported."
+        },
+        "rowCount": {
+          "type": "integer",
+          "description": "Verified record count of the active version (1 to 20000)."
+        },
+        "spatialRecordsCount": {
+          "type": "integer",
+          "description": "Count of records with valid WGS84 GPS coordinates."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 600,
+          "description": "Public provenance notes."
+        },
+        "lastEventId": {
+          "type": "string",
+          "minLength": 3,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "Firebase UID of the initial bootstrap administrator."
-        },
-        "bootstrapAdminEmail": {
-          "type": "string",
-          "format": "email",
-          "minLength": 3,
-          "maxLength": 254,
-          "description": "Verified email of the initial bootstrap administrator."
+          "description": "Document ID in activation_history atomically paired with this activation."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp when bootstrap completed (immutable)."
+          "description": "Server timestamp when pointer was first created (immutable)."
         },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp matching createdAt (immutable)."
+          "description": "Server timestamp of the latest activation or rollback."
         }
       },
-      "required": ["initialized", "bootstrapAdminUid", "bootstrapAdminEmail", "createdAt", "updatedAt"]
+      "required": [
+        "datasetKind",
+        "activeVersionId",
+        "versionLabel",
+        "sourceDocumentName",
+        "sourceFileName",
+        "effectiveDate",
+        "importedAt",
+        "rowCount",
+        "spatialRecordsCount",
+        "notes",
+        "lastEventId",
+        "createdAt",
+        "updatedAt"
+      ]
     },
-    "AdminSecurityConfig": {
-      "title": "AdminSecurityConfig",
-      "description": "Admin-only system configuration document reserved for upcoming milestones (M1.2+).",
+    "DatasetVersion": {
+      "title": "DatasetVersion",
+      "description": "Admin-only immutable version ledger tracking staging, commit verification, checksum, and provenance. Never deleted.",
       "type": "object",
       "properties": {
-        "configKey": {
+        "versionId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Version identifier matching the document ID."
+        },
+        "datasetKind": {
+          "type": "string",
+          "enum": ["state_price", "ecovis", "k_factor_rules", "market_survey"],
+          "description": "Dataset kind owned by this version."
+        },
+        "commitState": {
+          "type": "string",
+          "enum": ["staging", "committed", "aborted"],
+          "description": "Lifecycle state; committed and aborted are terminal states."
+        },
+        "versionLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "description": "Human-readable version label."
+        },
+        "sourceDocumentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Source legal document or survey name."
+        },
+        "sourceFileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 260,
+          "description": "Source Excel/CSV/JSON file name."
+        },
+        "effectiveDate": {
           "type": "string",
           "minLength": 1,
           "maxLength": 64,
-          "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "Identifier of the configuration document."
+          "description": "Effective or report date string."
         },
-        "description": {
+        "importedAt": {
           "type": "string",
-          "maxLength": 500,
-          "description": "Human-readable description of this configuration record."
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO import timestamp."
         },
-        "updatedByUid": {
+        "expectedRowCount": {
+          "type": "integer",
+          "description": "Expected number of validated rows (1 to 20000)."
+        },
+        "verifiedRowCount": {
+          "type": "integer",
+          "description": "Server-counted rows verified before committing (0 while staging, equals expectedRowCount when committed)."
+        },
+        "spatialRecordsCount": {
+          "type": "integer",
+          "description": "Number of rows carrying valid WGS84 coordinates."
+        },
+        "payloadChecksum": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 hex digest of the validated dataset payload."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 600,
+          "description": "Import notes."
+        },
+        "importedByUid": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "UID of the verified administrator who last modified this document."
+          "description": "Firebase Auth UID of the single fixed administrator."
+        },
+        "importedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified email of the administrator (PII, Admin-only collection)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when staging began (immutable)."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest state transition."
+        },
+        "committedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when commitState transitioned to committed."
+        }
+      },
+      "required": [
+        "versionId",
+        "datasetKind",
+        "commitState",
+        "versionLabel",
+        "sourceDocumentName",
+        "sourceFileName",
+        "effectiveDate",
+        "importedAt",
+        "expectedRowCount",
+        "verifiedRowCount",
+        "spatialRecordsCount",
+        "payloadChecksum",
+        "notes",
+        "importedByUid",
+        "importedByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StatePricePayload": {
+      "title": "StatePricePayload",
+      "description": "Structured payload for an official state land price table record (NQ 15/2025/NQ-HDND).",
+      "type": "object",
+      "properties": {
+        "legalDocumentName": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "wardCommune": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "districtCity": { "type": "string", "maxLength": 160 },
+        "streetName": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "roadSegment": { "type": "string", "maxLength": 300 },
+        "startPoint": { "type": "string", "maxLength": 200 },
+        "endPoint": { "type": "string", "maxLength": 200 },
+        "landType": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "position": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "unitPrice": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "sourcePageOrAppendix": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "effectiveDate": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "importedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "coordinateNote": { "type": "string", "maxLength": 240 }
+      },
+      "required": [
+        "legalDocumentName",
+        "wardCommune",
+        "districtCity",
+        "streetName",
+        "roadSegment",
+        "startPoint",
+        "endPoint",
+        "landType",
+        "position",
+        "unitPrice",
+        "unit",
+        "sourcePageOrAppendix",
+        "effectiveDate",
+        "importedAt"
+      ]
+    },
+    "EcovisPayload": {
+      "title": "EcovisPayload",
+      "description": "Structured payload for an ECOVIS survey valuation record.",
+      "type": "object",
+      "properties": {
+        "wardCommune": { "type": "string", "maxLength": 160 },
+        "districtCity": { "type": "string", "maxLength": 160 },
+        "streetName": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "roadSegment": { "type": "string", "maxLength": 300 },
+        "landType": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "position": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "surveyUnitPrice": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "sourceDocument": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "appendixAndPage": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "surveyOrReportDate": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "importedAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "coordinateNote": { "type": "string", "maxLength": 240 }
+      },
+      "required": [
+        "wardCommune",
+        "districtCity",
+        "streetName",
+        "roadSegment",
+        "landType",
+        "position",
+        "surveyUnitPrice",
+        "unit",
+        "sourceDocument",
+        "appendixAndPage",
+        "surveyOrReportDate",
+        "importedAt"
+      ]
+    },
+    "KFactorRulePayload": {
+      "title": "KFactorRulePayload",
+      "description": "Structured payload for an official K-factor adjustment rule.",
+      "type": "object",
+      "properties": {
+        "factorName": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "factorValue": { "type": "number" },
+        "formula": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "applicableCondition": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "requiredInputFields": { "type": "string", "maxLength": 300 },
+        "sourceDocument": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "sourcePage": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "effectiveDate": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "importedAt": { "type": "string", "minLength": 1, "maxLength": 64 }
+      },
+      "required": [
+        "factorName",
+        "factorValue",
+        "formula",
+        "applicableCondition",
+        "requiredInputFields",
+        "sourceDocument",
+        "sourcePage",
+        "effectiveDate",
+        "importedAt"
+      ]
+    },
+    "MarketSurveyPayload": {
+      "title": "MarketSurveyPayload",
+      "description": "Structured payload for a non-PII market reference listing record (asking price only, never completed transaction price).",
+      "type": "object",
+      "properties": {
+        "sourceName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "url": { "type": "string", "maxLength": 1000 },
+        "postedDate": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "address": { "type": "string", "minLength": 1, "maxLength": 360 },
+        "wardCommune": { "type": "string", "maxLength": 160 },
+        "areaSqm": { "type": "number" },
+        "askingPriceVnd": { "type": "number" },
+        "unitPricePerSqm": { "type": "number" },
+        "propertyType": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "locationInfo": { "type": "string", "maxLength": 300 },
+        "verificationStatus": {
+          "type": "string",
+          "enum": ["chua_xac_minh", "da_xac_minh_so_bo", "loai_tru"]
+        },
+        "verificationNote": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "isDuplicate": { "type": "boolean" },
+        "createdAtIso": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "coordinateNote": { "type": "string", "maxLength": 240 }
+      },
+      "required": [
+        "sourceName",
+        "url",
+        "postedDate",
+        "address",
+        "wardCommune",
+        "areaSqm",
+        "askingPriceVnd",
+        "unitPricePerSqm",
+        "propertyType",
+        "locationInfo",
+        "verificationStatus",
+        "verificationNote",
+        "isDuplicate",
+        "createdAtIso"
+      ]
+    },
+    "DatasetRecord": {
+      "title": "DatasetRecord",
+      "description": "Immutable, versioned, non-PII land price or reference record indexed by datasetKind, versionId, administrative keys, and optional Geohash.",
+      "type": "object",
+      "properties": {
+        "recordId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Record identifier matching the document ID."
+        },
+        "datasetKind": {
+          "type": "string",
+          "enum": ["state_price", "ecovis", "k_factor_rules", "market_survey"],
+          "description": "Dataset kind matching the parent DatasetVersion."
+        },
+        "versionId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent versionId in dataset_versions."
+        },
+        "recordCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Source record code, rule code, or listing code."
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["public"],
+          "description": "Explicit public visibility flag for rule-enforced list queries."
+        },
+        "isDemo": {
+          "type": "boolean",
+          "description": "Must always be false; DEMO data is forbidden in Firestore."
+        },
+        "districtKey": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^[a-z0-9_]*$",
+          "description": "Normalized ASCII district key for non-GPS administrative lookup."
+        },
+        "wardKey": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^[a-z0-9_]*$",
+          "description": "Normalized ASCII ward/commune key for non-GPS administrative lookup."
+        },
+        "streetKey": {
+          "type": "string",
+          "maxLength": 160,
+          "pattern": "^[a-z0-9_]*$",
+          "description": "Normalized ASCII street key."
+        },
+        "hasCoordinates": {
+          "type": "boolean",
+          "description": "True only when latitude, longitude, geohash5, and geohash6 are all valid."
+        },
+        "latitude": {
+          "type": "number",
+          "description": "Optional WGS84 latitude [-90, 90] (null when hasCoordinates is false)."
+        },
+        "longitude": {
+          "type": "number",
+          "description": "Optional WGS84 longitude [-180, 180] (null when hasCoordinates is false)."
+        },
+        "geohash5": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 5,
+          "pattern": "^[0-9b-hjkmnp-z]{5}$",
+          "description": "5-character Geohash (~4.9km cell) for bounded spatial queries."
+        },
+        "geohash6": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9b-hjkmnp-z]{6}$",
+          "description": "6-character Geohash (~1.2km cell) for finer spatial indexing."
+        },
+        "payload": {
+          "type": "object",
+          "description": "Native Firestore Map validated strictly per datasetKind (StatePricePayload | EcovisPayload | KFactorRulePayload | MarketSurveyPayload)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when record was written (immutable)."
+        }
+      },
+      "required": [
+        "recordId",
+        "datasetKind",
+        "versionId",
+        "recordCode",
+        "visibility",
+        "isDemo",
+        "districtKey",
+        "wardKey",
+        "streetKey",
+        "hasCoordinates",
+        "payload",
+        "createdAt"
+      ]
+    },
+    "ActivationHistoryEvent": {
+      "title": "ActivationHistoryEvent",
+      "description": "Append-only immutable Admin audit log recording every dataset version activation or rollback. Atomically paired with active_versions.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Event identifier matching the document ID."
+        },
+        "datasetKind": {
+          "type": "string",
+          "enum": ["state_price", "ecovis", "k_factor_rules", "market_survey"],
+          "description": "Dataset kind affected by this event."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["activate", "rollback"],
+          "description": "Operation type performed by Admin."
+        },
+        "fromVersionId": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Previous activeVersionId (empty string if initial activation)."
+        },
+        "toVersionId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Newly activated committed versionId."
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Optional reason or summary note."
+        },
+        "actorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the verified administrator."
+        },
+        "actorEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified administrator email (PII, Admin-only collection)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the event (immutable)."
+        }
+      },
+      "required": [
+        "eventId",
+        "datasetKind",
+        "action",
+        "fromVersionId",
+        "toVersionId",
+        "reason",
+        "actorUid",
+        "actorEmail",
+        "createdAt"
+      ]
+    },
+    "PdfReferenceDocument": {
+      "title": "PdfReferenceDocument",
+      "description": "Public non-PII catalog metadata for reference legal/valuation PDF documents (no binary blobs stored in Firestore).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 80,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Document identifier matching the document ID."
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 260,
+          "description": "Original PDF file name."
+        },
+        "documentTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Human-readable document title."
+        },
+        "documentCategory": {
+          "type": "string",
+          "enum": ["bang_gia_nha_nuoc", "bao_cao_ecovis", "quy_dinh_he_so_k", "khac"],
+          "description": "Reference document classification."
+        },
+        "pageCount": {
+          "type": "integer",
+          "description": "Optional positive page count (1 to 50000)."
+        },
+        "effectiveDate": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Effective or publication date string."
+        },
+        "appendixNote": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Appendix or page citation note."
+        },
+        "fileSizeBytes": {
+          "type": "integer",
+          "description": "Non-negative PDF file size in bytes."
+        },
+        "uploadedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "ISO timestamp when catalog entry was registered."
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["public"],
+          "description": "Public catalog visibility flag."
         },
         "createdAt": {
           "type": "string",
@@ -121,24 +643,48 @@
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server timestamp when last updated."
+          "description": "Server timestamp of the latest update."
         }
       },
-      "required": ["configKey", "updatedByUid", "createdAt", "updatedAt"]
+      "required": [
+        "id",
+        "fileName",
+        "documentTitle",
+        "documentCategory",
+        "effectiveDate",
+        "appendixNote",
+        "fileSizeBytes",
+        "uploadedAt",
+        "visibility",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
-    "/admins/{adminUid}": {
-      "schema": { "$ref": "#/entities/AdminRegistryEntry" },
-      "description": "Single source of truth for Admin RBAC (D1). Strictly deny-by-default; non-admins can only GET their own UID path for verification and can never write or list."
+    "/dataset_categories/{datasetKind}": {
+      "schema": { "$ref": "#/entities/DatasetCategory" },
+      "description": "Metadata registry for the 4 fixed dataset kinds. Public get only (zero PII); Admin write; no delete."
     },
-    "/adminSystem/bootstrap": {
-      "schema": { "$ref": "#/entities/AdminBootstrapLock" },
-      "description": "Immutable one-time lock document created atomically with the first Bootstrap Admin entry. Permanently seals Bootstrap after initialization."
+    "/active_versions/{datasetKind}": {
+      "schema": { "$ref": "#/entities/ActiveVersionPointer" },
+      "description": "Public non-PII pointer to the active committed version per datasetKind. Public get only; Admin atomic write synchronized with dataset_versions and activation_history; no delete."
     },
-    "/adminConfig/{configId}": {
-      "schema": { "$ref": "#/entities/AdminSecurityConfig" },
-      "description": "Protected administrative configuration namespace reserved for M1.2+."
+    "/dataset_versions/{versionId}": {
+      "schema": { "$ref": "#/entities/DatasetVersion" },
+      "description": "Admin-only version ledger with staging->committed/aborted lifecycle and SHA-256 checksum. Never deleted."
+    },
+    "/dataset_records/{recordId}": {
+      "schema": { "$ref": "#/entities/DatasetRecord" },
+      "description": "Immutable non-PII land price records indexed by datasetKind, versionId, administrative keys, and Geohash. Public read capped at limit<=500 with visibility=='public' and isDemo==false; Admin create only while parent version is staging; no update or delete."
+    },
+    "/activation_history/{eventId}": {
+      "schema": { "$ref": "#/entities/ActivationHistoryEvent" },
+      "description": "Admin-only append-only immutable audit log atomically paired with active_versions updates. No update or delete."
+    },
+    "/pdf_documents/{docId}": {
+      "schema": { "$ref": "#/entities/PdfReferenceDocument" },
+      "description": "Public non-PII PDF reference catalog metadata (no binary files). Public read capped at limit<=100; Admin CRUD."
     }
   }
 }
