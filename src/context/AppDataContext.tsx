@@ -1,11 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
-  DEMO_ECOVIS_RECORDS,
-  DEMO_K_FACTOR_RULES,
-  DEMO_MARKET_LISTINGS,
-  DEMO_STATE_PRICE_RECORDS,
-} from '../data/demoData';
-import {
   AppliedKFactorItem,
   AppraisalDossier,
   AttachOperationResult,
@@ -253,9 +247,9 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [serverSnapshot, setServerSnapshot] = useState<ServerActiveDatasetsSnapshot | null>(null);
   const [serverDatasetStatus, setServerDatasetStatus] = useState<'loading' | 'synced' | 'offline'>('loading');
 
-  // Isolated in-memory demo market listings so edits in demo mode never touch real data
+  // Isolated in-memory demo market listings (empty after demoData.ts removal)
   const [demoMarketListings, setDemoMarketListings] = useState<MarketListingRecord[]>(() =>
-    detectDuplicateMarketListings(DEMO_MARKET_LISTINGS)
+    detectDuplicateMarketListings([])
   );
 
   const [pdfDocuments, setPdfDocuments] = useState<PdfReferenceDocument[]>(() =>
@@ -457,9 +451,9 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return { versions, pdfDocuments: serializablePdfs };
   }, [realDatasets, pdfDocuments]);
 
-  const activeStateRecords = isDemoMode ? DEMO_STATE_PRICE_RECORDS : activeRealState.records;
-  const activeEcovisRecords = isDemoMode ? DEMO_ECOVIS_RECORDS : activeRealEcovis.records;
-  const activeKFactorRules = isDemoMode ? DEMO_K_FACTOR_RULES : activeRealKRules.records;
+  const activeStateRecords: StateLandPriceRecord[] = isDemoMode ? [] : activeRealState.records;
+  const activeEcovisRecords: EcovisRecord[] = isDemoMode ? [] : activeRealEcovis.records;
+  const activeKFactorRules: KFactorRuleRecord[] = isDemoMode ? [] : activeRealKRules.records;
   const activeMarketListings = isDemoMode ? demoMarketListings : combinedRealMarket;
 
   const allKnownMarketListings = useMemo(
