@@ -1,6 +1,6 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import { getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
@@ -68,17 +68,3 @@ export function handleFirestoreError(
   };
   throw new Error(JSON.stringify(errInfo));
 }
-
-// Startup connectivity validation (never logs keys, tokens, or secrets)
-async function testConnection(): Promise<void> {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Không thể kết nối máy chủ Cloud Firestore. Vui lòng kiểm tra cấu hình Firebase.');
-    }
-    // Expected permission-denied on /test/connection confirms Firestore is online and deny-by-default is active.
-  }
-}
-
-void testConnection();
