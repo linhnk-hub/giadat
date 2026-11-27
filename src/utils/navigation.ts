@@ -9,6 +9,20 @@ function readViteBaseUrl(): string {
   }
 }
 
+function inferRelativeSubpathPrefix(): string {
+  if (typeof window === 'undefined') return '';
+  const path = window.location.pathname || '/';
+  const adminMatch = path.match(/^\/([^/]+)\/admin(?:\/|$)/);
+  if (adminMatch && adminMatch[1]) {
+    return `/${adminMatch[1]}`;
+  }
+  const repoRootMatch = path.match(/^\/([^/]+)\/?$/);
+  if (repoRootMatch && repoRootMatch[1] && repoRootMatch[1] !== 'admin') {
+    return `/${repoRootMatch[1]}`;
+  }
+  return '';
+}
+
 /**
  * Normalizes a Vite BASE_URL (e.g. '/', './', '/repo/', '/repo') into a
  * prefix suitable for pathname matching: '' for root, or '/repo' (no trailing slash).
@@ -16,8 +30,11 @@ function readViteBaseUrl(): string {
 export function normalizeBasePrefix(baseUrl?: string): string {
   const raw = typeof baseUrl === 'string' ? baseUrl : readViteBaseUrl();
   const trimmed = raw.trim();
-  if (!trimmed || trimmed === '/' || trimmed === './') {
+  if (!trimmed || trimmed === '/') {
     return '';
+  }
+  if (trimmed === './') {
+    return inferRelativeSubpathPrefix();
   }
   const stripped = trimmed.replace(/^\/+|\/+$/g, '');
   return stripped ? `/${stripped}` : '';
