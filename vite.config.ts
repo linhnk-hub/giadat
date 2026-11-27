@@ -20,7 +20,7 @@ export default defineConfig(() => {
   const base = resolveViteBase(process.env.VITE_BASE_PATH);
 
   return {
-    base,
+    base: './',
     plugins: [
       react(),
       tailwindcss(),
