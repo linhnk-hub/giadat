@@ -31,6 +31,12 @@ import {
   type WorkbookSheetInput,
 } from '../src/utils/importExport';
 
+import {
+  isAdminPath,
+  stripBasePath,
+  withBasePath,
+} from '../src/utils/navigation';
+
 function normalizeCell(cell: unknown): string {
   if (cell === null || cell === undefined) return '';
   if (cell instanceof Date) return cell.toISOString().slice(0, 10);
@@ -83,8 +89,8 @@ async function main() {
     assert.ok(!/firebase\/storage/.test(storeSrc), 'firestoreDatasetStore must not use Firebase Storage');
   });
 
-  // 3. Simplified Public UX isolation (no admin/data-management/version tabs in public shell)
-  await check('3. Public UX lands directly on QuickLookupModule and hides admin/data-management/DEMO tabs', async () => {
+  // 3. Simplified Public UX isolation + discreet footer Admin Login entry point (/giadat/admin)
+  await check('3. Public UX lands directly on QuickLookupModule, hides admin panels/DEMO, and provides base-path-safe footer admin entry', async () => {
     const appSrc = await fs.readFile(path.resolve(process.cwd(), 'src/App.tsx'), 'utf8');
     const layoutSrc = await fs.readFile(path.resolve(process.cwd(), 'src/components/Layout.tsx'), 'utf8');
     const lookupSrc = await fs.readFile(path.resolve(process.cwd(), 'src/components/modules/QuickLookupModule.tsx'), 'utf8');
@@ -92,8 +98,16 @@ async function main() {
     assert.ok(appSrc.includes('<QuickLookupModule />'), 'App.tsx must render QuickLookupModule directly');
     assert.ok(appSrc.includes('isAdminPath(pathname)'), 'App.tsx must preserve /admin route guard');
     assert.ok(!appSrc.includes('DataManagementModule'), 'Public App.tsx must not directly mount DataManagementModule');
-    assert.ok(!layoutSrc.includes('/admin'), 'Public Layout must not expose admin navigation tabs');
+    assert.ok(!layoutSrc.includes('DataManagementModule'), 'Public Layout must not mount DataManagementModule');
     assert.ok(!layoutSrc.includes('isDemoMode'), 'Public Layout must not expose DEMO toggle');
+    assert.ok(layoutSrc.includes('Đăng nhập quản trị'), 'Footer must contain "Đăng nhập quản trị" link');
+    assert.ok(layoutSrc.includes("withBasePath('/admin')"), 'Footer link href must preserve base path via withBasePath');
+    assert.ok(layoutSrc.includes("navigateToPath('/admin')"), 'Footer link click must navigate via navigateToPath');
+    assert.equal(withBasePath('/admin', '/giadat/'), '/giadat/admin');
+    assert.equal(withBasePath('/', '/giadat/'), '/giadat/');
+    assert.equal(stripBasePath('/giadat/admin', '/giadat/'), '/admin');
+    assert.equal(isAdminPath('/giadat/admin', '/giadat/'), true);
+    assert.equal(isAdminPath('/giadat/', '/giadat/'), false);
     assert.ok(lookupSrc.includes('EMPTY_MARKET_DATA_MESSAGE'), 'QuickLookupModule must use exact empty-market constant');
   });
 

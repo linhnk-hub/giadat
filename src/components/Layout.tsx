@@ -1,12 +1,31 @@
 import React from 'react';
 import { Landmark } from 'lucide-react';
+import { navigateToPath, withBasePath } from '../utils/navigation';
 
 /**
  * Clean, mobile-first institutional shell for public land-price lookup.
- * Intentionally omits admin links, version history tabs, DEMO toggles, and
- * complex appraisal sidebars so regular users see the lookup workflow immediately.
+ * Keeps regular users focused on lookup without admin panels, version tabs,
+ * DEMO toggles, or complex sidebars, while providing a discreet footer entry
+ * point to /admin that preserves the configured base path (e.g. /giadat/admin).
  */
 export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const adminHref = withBasePath('/admin');
+
+  const handleAdminLinkClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    navigateToPath('/admin');
+  };
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F6F7F8] text-[#1F2429]">
       <header className="sticky top-0 z-30 border-b border-[#E2E5E9] bg-white">
@@ -35,11 +54,23 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       </main>
 
       <footer className="border-t border-[#E2E5E9] bg-white">
-        <div className="mx-auto max-w-5xl px-4 py-3 sm:px-6 text-[11px] leading-relaxed text-[#6B7280] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+        <div className="mx-auto max-w-5xl px-4 py-3 sm:px-6 text-[11px] leading-relaxed text-[#6B7280] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <span>
             Thông tin phục vụ tra cứu tham khảo nhanh; dữ liệu thị trường là giá rao bán, không phải giá giao dịch thành công.
           </span>
-          <span className="shrink-0 text-[#4B5563]">Tỉnh Khánh Hòa</span>
+          <div className="flex flex-wrap items-center justify-between sm:justify-end gap-x-3 gap-y-1 shrink-0">
+            <span className="text-[#4B5563]">Tỉnh Khánh Hòa</span>
+            <span className="text-[#CBD2D9] hidden sm:inline" aria-hidden="true">
+              ·
+            </span>
+            <a
+              href={adminHref}
+              onClick={handleAdminLinkClick}
+              className="inline-flex items-center min-h-[44px] sm:min-h-[28px] py-2 sm:py-0.5 text-xs sm:text-[11px] font-medium text-[#4B5563] hover:text-[#9D1D26] hover:underline underline-offset-2 transition-colors whitespace-nowrap"
+            >
+              Đăng nhập quản trị
+            </a>
+          </div>
         </div>
       </footer>
     </div>
