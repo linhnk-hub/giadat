@@ -277,6 +277,8 @@ export interface ValidationRowIssue {
 export interface ImportPreviewResult<T> {
   datasetKind: DatasetKind;
   fileName: string;
+  selectedSheetName?: string;
+  detectedHeaderRowNumber?: number;
   totalRows: number;
   validRows: T[];
   validSpatialCount?: number;

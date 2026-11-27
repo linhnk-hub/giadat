@@ -1,21 +1,24 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import dns from 'dns/promises';
 import net from 'net';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   requireAdminAuth,
   resolveFirebaseProjectId,
   type AdminAuthenticatedRequest,
 } from './server/adminAuth.ts';
+import { createCorsMiddleware } from './server/cors.ts';
 import {
   defaultDatasetStore,
   isValidDatasetKind,
   validateIncomingDatasetVersion,
   validateIncomingPdfMetadata,
+  type ServerDatasetStore,
   type ValidatedVersionPayload,
 } from './server/datasetStore.ts';
 import type { DatasetKind, PdfReferenceDocument } from './src/types/valuation.ts';
@@ -25,6 +28,14 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
+
+export interface CreateAppOptions {
+  datasetStore?: ServerDatasetStore;
+  corsAllowedOrigins?: string;
+  isProduction?: boolean;
+  serveStatic?: boolean;
+  distDir?: string;
+}
 
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -86,13 +97,37 @@ const RESTRICTED_SOCIAL_DOMAINS = [
   'tiktok.com',
 ];
 
-async function startServer() {
+export function createApp(options: CreateAppOptions = {}) {
+  const datasetStore = options.datasetStore ?? defaultDatasetStore;
+  const appIsProduction = options.isProduction ?? isProduction;
+  const serveStaticFlag =
+    options.serveStatic !== undefined
+      ? options.serveStatic
+      : process.env.SERVE_STATIC?.trim().toLowerCase() !== 'false';
+  const distPath = options.distDir ?? path.resolve(__dirname, 'dist');
+
   const app = express();
+
+  // Behind Render reverse proxy (TLS termination + forwarded headers)
+  app.set('trust proxy', 1);
+
+  // Strict allowlist CORS MUST run before adminRouter so OPTIONS preflight returns 204
+  // without hitting requireAdminAuth (401), while actual requests stay fully protected.
+  app.use(
+    createCorsMiddleware({
+      rawAllowedOrigins: options.corsAllowedOrigins,
+      isProduction: appIsProduction,
+    })
+  );
 
   app.use(express.json({ limit: '15mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json({
+      ok: true,
+      storageReady: datasetStore.isStorageReady(),
+    });
   });
 
   // =========================================================================
@@ -103,7 +138,7 @@ async function startServer() {
   app.get('/api/datasets/active', async (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     try {
-      const payload = await defaultDatasetStore.getPublicActiveDatasets();
+      const payload = await datasetStore.getPublicActiveDatasets();
       res.status(200).json(payload);
     } catch {
       res.status(500).json({
@@ -167,7 +202,7 @@ async function startServer() {
   adminRouter.get('/datasets', async (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     try {
-      const overview = await defaultDatasetStore.getAdminOverview();
+      const overview = await datasetStore.getAdminOverview();
       res.status(200).json(overview);
     } catch {
       res.status(500).json({
@@ -194,8 +229,8 @@ async function startServer() {
 
     try {
       const activate = body?.activate !== false;
-      const savedMeta = await defaultDatasetStore.commitVersion(kind, validated.data, activate);
-      const activeSnapshot = await defaultDatasetStore.getPublicActiveDatasets();
+      const savedMeta = await datasetStore.commitVersion(kind, validated.data, activate);
+      const activeSnapshot = await datasetStore.getPublicActiveDatasets();
       res.status(201).json({
         ok: true,
         version: savedMeta,
@@ -225,12 +260,12 @@ async function startServer() {
       }
 
       try {
-        const activated = await defaultDatasetStore.activateVersion(kind, versionId);
+        const activated = await datasetStore.activateVersion(kind, versionId);
         if (!activated) {
           res.status(404).json({ error: 'Không tìm thấy phiên bản dữ liệu cần khôi phục.' });
           return;
         }
-        const activeSnapshot = await defaultDatasetStore.getPublicActiveDatasets();
+        const activeSnapshot = await datasetStore.getPublicActiveDatasets();
         res.status(200).json({
           ok: true,
           version: activated,
@@ -255,7 +290,7 @@ async function startServer() {
       }
 
       try {
-        const version = await defaultDatasetStore.getVersionForExport(kind, versionId);
+        const version = await datasetStore.getVersionForExport(kind, versionId);
         if (!version) {
           res.status(404).json({ error: 'Không tìm thấy phiên bản dữ liệu cần xuất.' });
           return;
@@ -332,11 +367,11 @@ async function startServer() {
     }
 
     try {
-      const summary = await defaultDatasetStore.migrateLocalVersions(
+      const summary = await datasetStore.migrateLocalVersions(
         validatedEntries,
         validatedPdfs
       );
-      const activeSnapshot = await defaultDatasetStore.getPublicActiveDatasets();
+      const activeSnapshot = await datasetStore.getPublicActiveDatasets();
       res.status(200).json({
         ok: true,
         ...summary,
@@ -358,8 +393,8 @@ async function startServer() {
     }
 
     try {
-      const saved = await defaultDatasetStore.addPdfDocument(validated.data);
-      const activeSnapshot = await defaultDatasetStore.getPublicActiveDatasets();
+      const saved = await datasetStore.addPdfDocument(validated.data);
+      const activeSnapshot = await datasetStore.getPublicActiveDatasets();
       res.status(201).json({
         ok: true,
         pdfDocument: saved,
@@ -375,12 +410,12 @@ async function startServer() {
   adminRouter.delete('/datasets/pdfs/:id', async (req: AdminAuthenticatedRequest, res) => {
     res.setHeader('Cache-Control', 'no-store');
     try {
-      const removed = await defaultDatasetStore.removePdfDocument(req.params.id);
+      const removed = await datasetStore.removePdfDocument(req.params.id);
       if (!removed) {
         res.status(404).json({ error: 'Không tìm thấy tài liệu PDF cần xóa.' });
         return;
       }
-      const activeSnapshot = await defaultDatasetStore.getPublicActiveDatasets();
+      const activeSnapshot = await datasetStore.getPublicActiveDatasets();
       res.status(200).json({
         ok: true,
         activeSnapshot,
@@ -868,15 +903,40 @@ async function startServer() {
     }
   });
 
+  if (appIsProduction) {
+    const indexHtmlPath = path.join(distPath, 'index.html');
+    const shouldServeStatic = serveStaticFlag && fs.existsSync(indexHtmlPath);
+
+    if (shouldServeStatic) {
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(indexHtmlPath);
+      });
+    } else {
+      // Backend-only mode (e.g. Render Web Service without dist/ or SERVE_STATIC=false)
+      app.use((_req, res) => {
+        res.status(404).json({
+          error: 'Endpoint không tồn tại.',
+        });
+      });
+    }
+  }
+
+  return app;
+}
+
+export async function startServer() {
+  const storageCheck = await defaultDatasetStore.verifyStorageAccess();
+  if (!storageCheck.ready) {
+    console.warn(
+      `[Startup] Dataset storage check reported not ready (${storageCheck.errorCode ?? 'UNKNOWN'}).`
+    );
+  }
+
+  const app = createApp();
   const httpServer = http.createServer(app);
 
-  if (isProduction) {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  } else {
+  if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
@@ -892,9 +952,17 @@ async function startServer() {
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  return httpServer;
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+const isMainModule =
+  typeof process.argv[1] === 'string' &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

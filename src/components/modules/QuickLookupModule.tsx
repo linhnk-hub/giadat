@@ -24,6 +24,7 @@ import {
   FieldPhotoItem,
   ReverseGeocodeResult,
 } from '../../types/valuation';
+import { buildApiUrl } from '../../utils/apiClient';
 import { fileToDataUrl, parseImageExif } from '../../utils/exifParser';
 import {
   buildGoogleMapsUrl,
@@ -207,7 +208,7 @@ export const QuickLookupModule: React.FC = () => {
     if (!isValidCoordinatePair(lat, lng)) return null;
     setGeocodeLoading(true);
     try {
-      const resp = await fetch('/api/reverse-geocode', {
+      const resp = await fetch(buildApiUrl('/api/reverse-geocode'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ latitude: lat, longitude: lng }),
@@ -247,7 +248,7 @@ export const QuickLookupModule: React.FC = () => {
       const commaIdx = dataUrl.indexOf(',');
       const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
 
-      const resp = await fetch('/api/analyze-photo', {
+      const resp = await fetch(buildApiUrl('/api/analyze-photo'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -1,3 +1,4 @@
+import { constants as fsConstants } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -125,6 +126,32 @@ function sanitizeSafeUrl(value: unknown): string {
 function hasDemoMarkerText(value: string): boolean {
   const upper = value.toUpperCase();
   return upper.includes('[DEMO') || upper.startsWith('DEMO-');
+}
+
+function normalizeAsciiVi(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .trim();
+}
+
+function claimsCompletedTransactionPrice(text: string): boolean {
+  const norm = normalizeAsciiVi(text);
+  if (!norm) return false;
+  if (
+    norm.includes('khong phai gia giao dich') ||
+    norm.includes('khong phai giao dich') ||
+    norm.includes('not transaction') ||
+    norm.includes('not a completed transaction')
+  ) {
+    return false;
+  }
+  return /\b(gia giao dich|da giao dich|giao dich thanh cong|da ban|gia chot|chot giao dich|completed transaction|sold price)\b/.test(
+    norm
+  );
 }
 
 function validateOptionalCoordinates(
@@ -314,13 +341,15 @@ export function validateIncomingDatasetVersion(
       const streetName = cleanString(item.streetName, 240);
       const landType = cleanString(item.landType, 160);
       const appendixAndPage = cleanString(item.appendixAndPage, 200);
-      const sourceDocument = cleanString(item.sourceDocument, 300) || sourceDocumentName;
+      const sourceDocument =
+        cleanString(item.sourceDocument, 300) ||
+        (cleanString(metaObj.sourceDocumentName, 300) || '');
       const surveyUnitPrice = Number(item.surveyUnitPrice);
 
-      if (!recordCode || !streetName || !landType || !appendixAndPage) {
+      if (!recordCode || !streetName || !landType || !appendixAndPage || !sourceDocument) {
         return {
           ok: false,
-          error: `Dòng ${i + 1}: Thiếu trường bắt buộc của dữ liệu ECOVIS (mã, tuyến đường, loại đất, phụ lục & trang).`,
+          error: `Dòng ${i + 1}: Thiếu trường bắt buộc của dữ liệu ECOVIS (mã, tuyến đường, loại đất, nguồn tài liệu, phụ lục & trang).`,
         };
       }
       if (hasDemoMarkerText(recordCode) || hasDemoMarkerText(sourceDocument) || hasDemoMarkerText(streetName)) {
@@ -471,18 +500,26 @@ export function validateIncomingDatasetVersion(
     }
     const listingCode = cleanString(item.listingCode, 120);
     const sourceName = cleanString(item.sourceName, 200);
+    const postedDate = cleanString(item.postedDate, 64);
     const address = cleanString(item.address, 360);
     const areaSqm = Number(item.areaSqm);
     const askingPriceVnd = Number(item.askingPriceVnd);
 
-    if (!listingCode || !sourceName || !address) {
+    if (!listingCode || !sourceName || !postedDate || !address) {
       return {
         ok: false,
-        error: `Dòng ${i + 1}: Thiếu trường bắt buộc của tin khảo sát thị trường (mã tin, nguồn tin, địa chỉ).`,
+        error: `Dòng ${i + 1}: Thiếu trường bắt buộc của tin khảo sát thị trường (mã tin, nguồn tin, ngày đăng, địa chỉ).`,
       };
     }
     if (hasDemoMarkerText(listingCode) || hasDemoMarkerText(sourceName) || hasDemoMarkerText(address)) {
       return { ok: false, error: `Dòng ${i + 1}: Bản ghi chứa dấu hiệu [DEMO] không được phép nạp vào kho dữ liệu thật.` };
+    }
+    const verificationNoteRaw = cleanString(item.verificationNote, 400);
+    if (claimsCompletedTransactionPrice(verificationNoteRaw)) {
+      return {
+        ok: false,
+        error: `Dòng ${i + 1}: Không được gán nhãn tin rao bán thị trường là giá giao dịch thực tế / đã bán.`,
+      };
     }
     if (seenCodes.has(listingCode)) {
       return { ok: false, error: `Dòng ${i + 1}: Trùng mã tin khảo sát "${listingCode}".` };
@@ -511,7 +548,7 @@ export function validateIncomingDatasetVersion(
       listingCode,
       sourceName,
       url: sanitizeSafeUrl(item.url),
-      postedDate: cleanString(item.postedDate, 64),
+      postedDate,
       address,
       wardCommune: cleanString(item.wardCommune, 160),
       areaSqm,
@@ -521,7 +558,7 @@ export function validateIncomingDatasetVersion(
       locationInfo: cleanString(item.locationInfo, 300),
       verificationStatus,
       verificationNote:
-        cleanString(item.verificationNote, 400) || 'Nhập từ bảng khảo sát – chưa xác minh.',
+        verificationNoteRaw || 'Giá rao bán tham khảo (chưa xác minh – không phải giá giao dịch thực tế).',
       isDuplicate: false,
       duplicateOfId: null,
       createdAt: cleanString(item.createdAt, 64) || importedAt,
@@ -626,59 +663,181 @@ function resolveActiveBucket<T>(bucket: StoredVersionBucket<T>): {
   };
 }
 
+export function resolveDatasetStorePath(
+  customFilePath?: string,
+  envFilePath?: string
+): string {
+  const customTrimmed = customFilePath?.trim();
+  if (customTrimmed) {
+    return path.resolve(customTrimmed);
+  }
+  const envTrimmed = envFilePath?.trim();
+  if (envTrimmed) {
+    return path.resolve(envTrimmed);
+  }
+  return path.resolve(__dirname, '../data/datasets-store.json');
+}
+
+function createCodedError(code: string, message: string): NodeJS.ErrnoException {
+  const err = new Error(message) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
 /**
- * Server-side durable versioned Dataset Store (M1.2).
- * Uses atomic temp-file write + rename inside a fixed project-local directory
- * with serialized write queueing to prevent concurrent file corruption.
- * Cleanly encapsulated behind a store class so a future Firestore adapter
- * (once Firestore Rules / IAM are approved) can swap in without changing APIs.
+ * Server-side durable versioned Dataset Store (M1.2 / M4.1).
+ * Reads path from DATA_STORE_PATH (e.g. Render Persistent Disk /var/data/datasets-store.json)
+ * with fallback to project-local data/datasets-store.json for development.
+ * Uses atomic temp-file write + rename inside the same directory with sequential
+ * single-instance write queueing. Never silently overwrites corrupt/unreadable files.
  */
 export class ServerDatasetStore {
   private readonly filePath: string;
   private cache: PersistedDatasetsStore | null = null;
   private writeChain: Promise<void> = Promise.resolve();
+  private storageReady = false;
 
   constructor(customFilePath?: string) {
-    this.filePath = customFilePath ?? path.resolve(__dirname, '../data/datasets-store.json');
+    this.filePath = resolveDatasetStorePath(customFilePath, process.env.DATA_STORE_PATH);
+  }
+
+  getStorageFilePath(): string {
+    return this.filePath;
+  }
+
+  isStorageReady(): boolean {
+    return this.storageReady;
+  }
+
+  /**
+   * Startup check verifying parent directory creation/write permissions and, if the
+   * store file already exists, read+write permissions plus valid JSON integrity
+   * without mutating or overwriting any existing file.
+   */
+  async verifyStorageAccess(): Promise<{ ready: boolean; errorCode?: string }> {
+    const dir = path.dirname(this.filePath);
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.access(dir, fsConstants.R_OK | fsConstants.W_OK);
+
+      let fileExists = false;
+      try {
+        await fs.stat(this.filePath);
+        fileExists = true;
+      } catch (statErr) {
+        const code = (statErr as NodeJS.ErrnoException | null)?.code;
+        if (code !== 'ENOENT') {
+          throw statErr;
+        }
+      }
+
+      if (fileExists) {
+        await fs.access(this.filePath, fsConstants.R_OK | fsConstants.W_OK);
+        await this.loadInternal();
+      }
+
+      this.storageReady = true;
+      return { ready: true };
+    } catch (err) {
+      this.storageReady = false;
+      const errorCode = (err as NodeJS.ErrnoException | null)?.code || 'STORAGE_ACCESS_ERROR';
+      console.error(
+        `[DatasetStore] Startup storage verification failed (${errorCode}). Existing data will not be overwritten.`
+      );
+      return { ready: false, errorCode };
+    }
   }
 
   private async loadInternal(): Promise<PersistedDatasetsStore> {
     if (this.cache) return this.cache;
+
+    let raw: string;
     try {
-      const raw = await fs.readFile(this.filePath, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<PersistedDatasetsStore>;
-      const empty = createEmptyDatasetsStore();
-      this.cache = {
-        schemaVersion: 1,
-        updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : empty.updatedAt,
-        statePrice: parsed.statePrice ?? empty.statePrice,
-        ecovis: parsed.ecovis ?? empty.ecovis,
-        kFactorRules: parsed.kFactorRules ?? empty.kFactorRules,
-        marketSurvey: parsed.marketSurvey ?? empty.marketSurvey,
-        pdfDocuments: Array.isArray(parsed.pdfDocuments) ? parsed.pdfDocuments : [],
-      };
-      return this.cache;
-    } catch {
-      this.cache = createEmptyDatasetsStore();
-      return this.cache;
+      raw = await fs.readFile(this.filePath, 'utf-8');
+    } catch (readErr) {
+      const code = (readErr as NodeJS.ErrnoException | null)?.code;
+      if (code === 'ENOENT') {
+        this.cache = createEmptyDatasetsStore();
+        return this.cache;
+      }
+      this.storageReady = false;
+      console.error(
+        `[DatasetStore] Failed to read dataset store file (${code || 'READ_ERROR'}). Refusing to fall back to empty store.`
+      );
+      throw createCodedError(
+        code || 'DATASET_STORE_READ_ERROR',
+        'Không thể đọc tệp dữ liệu nguồn trên máy chủ (lỗi truy cập hoặc phân quyền tệp).'
+      );
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.storageReady = false;
+      console.error(
+        '[DatasetStore] Dataset store file contains invalid/corrupted JSON. Refusing to overwrite with empty store.'
+      );
+      throw createCodedError(
+        'DATASET_STORE_CORRUPT_JSON',
+        'Tệp dữ liệu nguồn bị hỏng định dạng JSON. Hệ thống từ chối khởi tạo rỗng để bảo toàn dữ liệu.'
+      );
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      this.storageReady = false;
+      console.error(
+        '[DatasetStore] Dataset store root value is not a valid JSON object. Refusing to overwrite.'
+      );
+      throw createCodedError(
+        'DATASET_STORE_CORRUPT_JSON',
+        'Cấu trúc tệp dữ liệu nguồn không hợp lệ. Hệ thống từ chối ghi đè tự động.'
+      );
+    }
+
+    const parsedObj = parsed as Partial<PersistedDatasetsStore>;
+    const empty = createEmptyDatasetsStore();
+    this.cache = {
+      schemaVersion: 1,
+      updatedAt: typeof parsedObj.updatedAt === 'string' ? parsedObj.updatedAt : empty.updatedAt,
+      statePrice: parsedObj.statePrice ?? empty.statePrice,
+      ecovis: parsedObj.ecovis ?? empty.ecovis,
+      kFactorRules: parsedObj.kFactorRules ?? empty.kFactorRules,
+      marketSurvey: parsedObj.marketSurvey ?? empty.marketSurvey,
+      pdfDocuments: Array.isArray(parsedObj.pdfDocuments) ? parsedObj.pdfDocuments : [],
+    };
+    this.storageReady = true;
+    return this.cache;
   }
 
   private async saveInternal(store: PersistedDatasetsStore): Promise<void> {
-    store.updatedAt = new Date().toISOString();
+    const nextStore: PersistedDatasetsStore = {
+      ...store,
+      updatedAt: new Date().toISOString(),
+    };
     const dir = path.dirname(this.filePath);
     await fs.mkdir(dir, { recursive: true });
-    const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmpPath, JSON.stringify(store, null, 2), 'utf-8');
-    await fs.rename(tmpPath, this.filePath);
-    this.cache = store;
+    const tmpPath = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random()
+      .toString(36)
+      .slice(2, 8)}.tmp`;
+
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(nextStore, null, 2), 'utf-8');
+      await fs.rename(tmpPath, this.filePath);
+      this.cache = nextStore;
+      this.storageReady = true;
+    } catch (writeErr) {
+      await fs.unlink(tmpPath).catch(() => undefined);
+      throw writeErr;
+    }
   }
 
   private enqueueWrite<T>(task: (store: PersistedDatasetsStore) => Promise<T> | T): Promise<T> {
     const run = this.writeChain.then(async () => {
-      const store = await this.loadInternal();
-      const result = await task(store);
-      await this.saveInternal(store);
+      const current = await this.loadInternal();
+      const workingCopy = structuredClone(current);
+      const result = await task(workingCopy);
+      await this.saveInternal(workingCopy);
       return result;
     });
     this.writeChain = run.then(

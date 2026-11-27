@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useAppData } from '../../context/AppDataContext';
 import { MarketListingRecord } from '../../types/valuation';
+import { buildApiUrl } from '../../utils/apiClient';
 import {
   formatCurrencyVnd,
   formatNumberVi,
@@ -70,7 +71,7 @@ export const MarketSurveyModule: React.FC = () => {
     setInspectingUrl(true);
     setUrlInspectionMsg(null);
     try {
-      const resp = await fetch('/api/inspect-listing-url', {
+      const resp = await fetch(buildApiUrl('/api/inspect-listing-url'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: urlInput.trim() }),

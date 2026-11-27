@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useAppData } from '../../context/AppDataContext';
 import { CoordinateSourceType, FieldPhotoItem } from '../../types/valuation';
+import { buildApiUrl } from '../../utils/apiClient';
 import { fileToDataUrl, parseImageExif } from '../../utils/exifParser';
 import {
   buildGoogleMapsUrl,
@@ -117,7 +118,7 @@ export const PhotoGpsModule: React.FC = () => {
       const commaIdx = photo.previewDataUrl.indexOf(',');
       const base64 = commaIdx >= 0 ? photo.previewDataUrl.slice(commaIdx + 1) : photo.previewDataUrl;
 
-      const resp = await fetch('/api/analyze-photo', {
+      const resp = await fetch(buildApiUrl('/api/analyze-photo'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -8,6 +8,7 @@ import {
 } from 'firebase/auth';
 import { auth, googleProvider } from '../firebase';
 import { createVerificationCoordinator } from '../utils/adminVerifyCoordinator';
+import { buildApiUrl } from '../utils/apiClient';
 
 export type AdminAuthStatus =
   | 'loading'
@@ -109,7 +110,7 @@ export const AdminAuthProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         async (): Promise<BackendVerifyOutcome> => {
           try {
             const idToken = await user.getIdToken(forceRefreshToken);
-            const response = await fetch('/api/admin/session', {
+            const response = await fetch(buildApiUrl('/api/admin/session'), {
               method: 'GET',
               headers: {
                 Authorization: `Bearer ${idToken}`,

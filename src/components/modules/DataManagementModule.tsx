@@ -27,12 +27,13 @@ import {
   PdfReferenceDocument,
   StateLandPriceRecord,
 } from '../../types/valuation';
+import { buildApiUrl } from '../../utils/apiClient';
 import { formatBytes, formatDateTimeVi } from '../../utils/formatters';
 import {
   downloadExcelTemplate,
   downloadJsonPayload,
   downloadJsonTemplate,
-  parseSpreadsheetFile,
+  parseSpreadsheetFileWithMeta,
   validateAndPreviewImport,
 } from '../../utils/importExport';
 
@@ -111,7 +112,7 @@ export const DataManagementModule: React.FC = () => {
     setLoadingOverview(true);
     try {
       const headers = await getAdminAuthHeaders(false);
-      const res = await fetch('/api/admin/datasets', {
+      const res = await fetch(buildApiUrl('/api/admin/datasets'), {
         method: 'GET',
         headers,
         cache: 'no-store',
@@ -143,13 +144,13 @@ export const DataManagementModule: React.FC = () => {
     setPreview(null);
 
     try {
-      const rows = await parseSpreadsheetFile(file);
+      const parsed = await parseSpreadsheetFileWithMeta(file, selectedKind);
       const tempVersionId = `v-${Date.now()}`;
-      const result = validateAndPreviewImport(selectedKind, file.name, rows, {
-        sourceDocumentName:
-          sourceDocumentName.trim() || DATASET_LABELS[selectedKind],
+      const result = validateAndPreviewImport(selectedKind, file.name, parsed.rows, {
+        sourceDocumentName: sourceDocumentName.trim(),
         effectiveDate: effectiveDate.trim(),
         versionId: tempVersionId,
+        selectedSheetName: parsed.selectedSheetName,
       });
       setPreview(result);
     } catch (err) {
@@ -207,7 +208,9 @@ export const DataManagementModule: React.FC = () => {
       };
 
       const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(`/api/admin/datasets/${preview.datasetKind}/versions`, {
+      const response = await fetch(
+        buildApiUrl(`/api/admin/datasets/${preview.datasetKind}/versions`),
+        {
         method: 'POST',
         headers: {
           ...headers,
@@ -274,7 +277,9 @@ export const DataManagementModule: React.FC = () => {
     try {
       const headers = await getAdminAuthHeaders(false);
       const response = await fetch(
-        `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/activate`,
+        buildApiUrl(
+          `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/activate`
+        ),
         {
           method: 'POST',
           headers,
@@ -312,7 +317,9 @@ export const DataManagementModule: React.FC = () => {
     try {
       const headers = await getAdminAuthHeaders(false);
       const response = await fetch(
-        `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/export`,
+        buildApiUrl(
+          `/api/admin/datasets/${kind}/versions/${encodeURIComponent(versionId)}/export`
+        ),
         {
           method: 'GET',
           headers,
@@ -340,7 +347,7 @@ export const DataManagementModule: React.FC = () => {
     try {
       const localPayload = exportLocalDatasetsForMigration();
       const headers = await getAdminAuthHeaders(false);
-      const response = await fetch('/api/admin/datasets/migrate-local', {
+      const response = await fetch(buildApiUrl('/api/admin/datasets/migrate-local'), {
         method: 'POST',
         headers: {
           ...headers,
@@ -399,7 +406,7 @@ export const DataManagementModule: React.FC = () => {
 
     try {
       const headers = await getAdminAuthHeaders(false);
-      const response = await fetch('/api/admin/datasets/pdfs', {
+      const response = await fetch(buildApiUrl('/api/admin/datasets/pdfs'), {
         method: 'POST',
         headers: {
           ...headers,
@@ -440,7 +447,9 @@ export const DataManagementModule: React.FC = () => {
     if (!(await ensureVerifiedAdmin())) return;
     try {
       const headers = await getAdminAuthHeaders(false);
-      const response = await fetch(`/api/admin/datasets/pdfs/${encodeURIComponent(id)}`, {
+      const response = await fetch(
+        buildApiUrl(`/api/admin/datasets/pdfs/${encodeURIComponent(id)}`),
+        {
         method: 'DELETE',
         headers,
         cache: 'no-store',
@@ -733,8 +742,10 @@ export const DataManagementModule: React.FC = () => {
               <div>
                 <div className="text-[15px] font-semibold text-[#1F2429]">
                   Xem trước kiểm tra tệp: {preview.fileName}
+                  {preview.selectedSheetName ? ` (Sheet: ${preview.selectedSheetName})` : ''}
                 </div>
                 <div className="mt-1 text-xs text-[#4B5563] font-mono tabular-nums">
+                  {preview.detectedHeaderRowNumber ? `Tiêu đề dòng #${preview.detectedHeaderRowNumber} · ` : ''}
                   Tổng dòng: {preview.totalRows} · Hợp lệ: {preview.validRows.length} · Có tọa độ GPS:{' '}
                   {preview.validSpatialCount ?? 0} · Mã trùng: {preview.duplicateCodes.length} · Lỗi chặn:{' '}
                   {errorIssuesCount} · Cảnh báo: {warningIssuesCount}

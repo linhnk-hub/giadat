@@ -1,4 +1,4 @@
-import { readSheet } from 'read-excel-file/browser';
+import readXlsxFile from 'read-excel-file/browser';
 import writeXlsxFile from 'write-excel-file/browser';
 import {
   AppraisalDossier,
@@ -22,6 +22,7 @@ import {
 } from './dossierIntegrity';
 import {
   buildGoogleMapsUrl,
+  detectDuplicateMarketListings,
   formatCoordinate,
   formatCurrencyVnd,
   formatDateTimeVi,
@@ -114,39 +115,121 @@ export function parseJsonTextToRows(jsonText: string): string[][] {
   return rows;
 }
 
-export async function parseSpreadsheetFile(file: File): Promise<string[][]> {
+export interface WorkbookSheetInput {
+  sheet: string;
+  rows: string[][];
+}
+
+export interface ParsedSpreadsheetResult {
+  rows: string[][];
+  selectedSheetName?: string;
+  availableSheetNames?: string[];
+}
+
+function normalizeRawCell(cell: unknown): string {
+  if (cell === null || cell === undefined) return '';
+  if (cell instanceof Date) {
+    return cell.toISOString().slice(0, 10);
+  }
+  return String(cell).trim();
+}
+
+/**
+ * Selects the most appropriate worksheet from a multi-sheet Excel workbook
+ * for the requested dataset kind (e.g. NQ 15-2025 vs ECOVIS 2025).
+ */
+export function selectWorkbookSheetForDataset(
+  sheets: WorkbookSheetInput[],
+  datasetKind?: DatasetKind
+): WorkbookSheetInput | null {
+  if (sheets.length === 0) return null;
+  if (sheets.length === 1 || !datasetKind) return sheets[0];
+
+  const scored = sheets.map((s, idx) => {
+    const nameNorm = normalizeVietnameseText(s.sheet).replace(/[_-]+/g, ' ');
+    const bannerNorm = normalizeVietnameseText((s.rows[0] || []).join(' ')).replace(/[_-]+/g, ' ');
+    const combined = `${nameNorm} ${bannerNorm}`;
+    let score = 0;
+
+    const isComparisonSheet =
+      nameNorm.includes('doi chieu') ||
+      nameNorm.includes('so sanh') ||
+      bannerNorm.includes('bang doi chieu');
+    if (isComparisonSheet) score -= 50;
+
+    if (datasetKind === 'state_price') {
+      if (nameNorm.includes('nq') || nameNorm.includes('nha nuoc') || nameNorm.includes('bang gia')) score += 20;
+      if (bannerNorm.includes('nghi quyet') || bannerNorm.includes('nq hdnd') || bannerNorm.includes('15/2025')) score += 25;
+      if (nameNorm.includes('ecovis') || bannerNorm.includes('ecovis')) score -= 40;
+    } else if (datasetKind === 'ecovis') {
+      if (nameNorm.includes('ecovis')) score += 35;
+      if (bannerNorm.includes('ecovis') || bannerNorm.includes('bc e afa')) score += 25;
+      if (nameNorm.includes('nq 15') && !nameNorm.includes('ecovis')) score -= 30;
+    } else if (datasetKind === 'k_factor_rules') {
+      if (combined.includes('he so k') || combined.includes('k factor') || combined.includes('he so')) score += 30;
+    } else if (datasetKind === 'market_survey') {
+      if (
+        combined.includes('thi truong') ||
+        combined.includes('rao ban') ||
+        combined.includes('market')
+      ) {
+        score += 30;
+      }
+      if (combined.includes('ecovis') && !combined.includes('rao ban')) score -= 20;
+    }
+
+    return { sheet: s, score, idx };
+  });
+
+  scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.idx - b.idx));
+  return scored[0].sheet;
+}
+
+export async function parseSpreadsheetFileWithMeta(
+  file: File,
+  datasetKind?: DatasetKind
+): Promise<ParsedSpreadsheetResult> {
   const lower = file.name.toLowerCase();
   if (lower.endsWith('.xlsx')) {
-    const rows = await readSheet(file);
-    return rows.map((row) =>
-      row.map((cell) => {
-        if (cell === null || cell === undefined) return '';
-        if (cell instanceof Date) {
-          return cell.toISOString().slice(0, 10);
-        }
-        return String(cell).trim();
-      })
-    );
+    const workbookSheets = await readXlsxFile(file);
+    const converted: WorkbookSheetInput[] = workbookSheets.map((ws) => ({
+      sheet: ws.sheet,
+      rows: ws.data.map((row) => row.map(normalizeRawCell)),
+    }));
+    const selected = selectWorkbookSheetForDataset(converted, datasetKind);
+    return {
+      rows: selected ? selected.rows : [],
+      selectedSheetName: selected?.sheet,
+      availableSheetNames: converted.map((s) => s.sheet),
+    };
   }
 
   if (lower.endsWith('.csv') || lower.endsWith('.txt')) {
     const text = await file.text();
     const cleaned = text.replace(/^\uFEFF/, '');
     const lines = cleaned.split(/\r?\n/).filter((l) => l.trim().length > 0);
-    if (lines.length === 0) return [];
+    if (lines.length === 0) return { rows: [] };
     const firstLine = lines[0];
     const commaCount = (firstLine.match(/,/g) || []).length;
     const semiCount = (firstLine.match(/;/g) || []).length;
     const delimiter = semiCount > commaCount ? ';' : ',';
-    return lines.map((line) => parseCsvLine(line, delimiter));
+    return { rows: lines.map((line) => parseCsvLine(line, delimiter)) };
   }
 
   if (lower.endsWith('.json')) {
     const text = await file.text();
-    return parseJsonTextToRows(text);
+    return { rows: parseJsonTextToRows(text) };
   }
 
   throw new Error('Định dạng tệp không được hỗ trợ. Vui lòng sử dụng tệp .xlsx, .csv hoặc .json.');
+}
+
+export async function parseSpreadsheetFile(
+  file: File,
+  datasetKind?: DatasetKind
+): Promise<string[][]> {
+  const res = await parseSpreadsheetFileWithMeta(file, datasetKind);
+  return res.rows;
 }
 
 export type NumericFieldKind = 'currency_integer' | 'decimal_measurement';
@@ -374,19 +457,154 @@ export function parseVietnameseNumber(
   };
 }
 
+function normalizeHeaderKey(header: string): string {
+  return normalizeVietnameseText(header)
+    .replace(/[_\-/.()]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function findColumnIndex(headers: string[], candidates: string[]): number {
-  const normHeaders = headers.map((h) => normalizeVietnameseText(h));
+  const normHeaders = headers.map((h) => normalizeHeaderKey(h));
   for (const cand of candidates) {
-    const normCand = normalizeVietnameseText(cand);
+    const normCand = normalizeHeaderKey(cand);
     const exact = normHeaders.findIndex((h) => h === normCand);
     if (exact !== -1) return exact;
   }
   for (const cand of candidates) {
-    const normCand = normalizeVietnameseText(cand);
+    const normCand = normalizeHeaderKey(cand);
     const partial = normHeaders.findIndex((h) => h.includes(normCand));
     if (partial !== -1) return partial;
   }
   return -1;
+}
+
+function hasDemoMarkerText(value: string): boolean {
+  const upper = value.trim().toUpperCase();
+  return upper.includes('[DEMO') || upper.startsWith('DEMO-');
+}
+
+function isPlaceholderDash(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed === '' || trimmed === '-' || trimmed === '—' || trimmed === '–';
+}
+
+function composeProvenanceDetail(
+  primary: string,
+  section: string,
+  pdfPage: string,
+  originalOrder: string
+): string {
+  const cleanedPrimary = isPlaceholderDash(primary) ? '' : primary.trim();
+  if (cleanedPrimary) return cleanedPrimary;
+
+  const parts: string[] = [];
+  if (!isPlaceholderDash(section)) parts.push(section.trim());
+  if (!isPlaceholderDash(pdfPage)) {
+    const p = pdfPage.trim();
+    parts.push(/^\d+$/.test(p) ? `Trang ${p}` : p);
+  }
+  if (!isPlaceholderDash(originalOrder)) {
+    parts.push(`STT ${originalOrder.trim()}`);
+  }
+  return parts.join(' · ');
+}
+
+function composeRoadSegment(segment: string, startPoint: string, endPoint: string): string {
+  if (!isPlaceholderDash(segment)) return segment.trim();
+  const s = isPlaceholderDash(startPoint) ? '' : startPoint.trim();
+  const e = isPlaceholderDash(endPoint) ? '' : endPoint.trim();
+  if (s && e) return `${s} – ${e}`;
+  return s || e;
+}
+
+function isValidMarketPostedDate(raw: string): boolean {
+  const val = raw.trim();
+  if (!val) return false;
+  // ISO YYYY-MM-DD (or timestamp), DD/MM/YYYY, DD-MM-YYYY, MM/YYYY, or YYYY/MM/DD
+  if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s].*)?$/.test(val)) return true;
+  if (/^\d{1,2}[-/]\d{1,2}[-/]\d{4}$/.test(val)) return true;
+  if (/^\d{1,2}[-/]\d{4}$/.test(val)) return true;
+  const parsed = Date.parse(val);
+  return !Number.isNaN(parsed);
+}
+
+function claimsCompletedTransactionPrice(text: string): boolean {
+  const norm = normalizeVietnameseText(text);
+  if (!norm) return false;
+  if (
+    norm.includes('khong phai gia giao dich') ||
+    norm.includes('khong phai giao dich') ||
+    norm.includes('not transaction') ||
+    norm.includes('not a completed transaction')
+  ) {
+    return false;
+  }
+  return /\b(gia giao dich|da giao dich|giao dich thanh cong|da ban|gia chot|chot giao dich|completed transaction|sold price)\b/.test(
+    norm
+  );
+}
+
+const HEADER_DETECTION_TOKENS: Record<DatasetKind, string[][]> = {
+  state_price: [
+    ['ma_du_lieu', 'recordcode', 'ma'],
+    ['xa_phuong', 'xa_thi_tran', 'wardcommune'],
+    ['tuyen_duong', 'ten_duong', 'streetname'],
+    ['loai_dat', 'landtype'],
+    ['vi_tri', 'position'],
+    ['don_gia', 'unitprice'],
+    ['trang_phu_luc', 'trang_pdf', 'dieu_khoan_muc'],
+  ],
+  ecovis: [
+    ['ma_du_lieu', 'recordcode', 'ma'],
+    ['tuyen_duong', 'ten_duong', 'streetname'],
+    ['loai_dat', 'landtype'],
+    ['don_gia_khao_sat', 'don_gia', 'surveyunitprice'],
+    ['phu_luc_trang', 'trang_pdf', 'dieu_khoan_muc'],
+    ['nguon_tai_lieu', 'tai_lieu_nguon', 'so_nq_bc'],
+  ],
+  k_factor_rules: [
+    ['ma_he_so', 'rulecode', 'ma_du_lieu'],
+    ['ten_he_so', 'factorname'],
+    ['gia_tri', 'factorvalue', 'he_so'],
+    ['cong_thuc', 'formula'],
+    ['dieu_kien_ap_dung', 'applicablecondition'],
+    ['trang_tham_chieu', 'sourcepage'],
+  ],
+  market_survey: [
+    ['ma_tin', 'listingcode', 'ma_du_lieu'],
+    ['nguon_tin', 'sourcename'],
+    ['ngay_dang', 'posteddate'],
+    ['dia_chi', 'address'],
+    ['dien_tich', 'areasqm'],
+    ['gia_rao_ban', 'askingpricevnd'],
+  ],
+};
+
+function detectHeaderRowIndex(rows: string[][], datasetKind: DatasetKind): number {
+  const groups = HEADER_DETECTION_TOKENS[datasetKind];
+  let bestIdx = 0;
+  let bestScore = -1;
+  const maxInspect = Math.min(rows.length, 6);
+
+  for (let i = 0; i < maxInspect; i++) {
+    const row = rows[i];
+    const nonEmptyCells = row.filter((c) => c.trim() !== '').length;
+    if (nonEmptyCells < 2) continue;
+
+    let matchedGroups = 0;
+    for (const group of groups) {
+      if (findColumnIndex(row, group) !== -1) {
+        matchedGroups += 1;
+      }
+    }
+    if (matchedGroups > bestScore) {
+      bestScore = matchedGroups;
+      bestIdx = i;
+    }
+  }
+
+  return bestScore >= 3 ? bestIdx : 0;
 }
 
 const KHANH_HOA_BOUNDS = {
@@ -469,12 +687,14 @@ export function validateAndPreviewImport(
     sourceDocumentName: string;
     effectiveDate: string;
     versionId: string;
+    selectedSheetName?: string;
   }
 ): ImportPreviewResult<StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord> {
   if (rows.length < 2) {
     return {
       datasetKind,
       fileName,
+      selectedSheetName: sourceMeta.selectedSheetName,
       totalRows: 0,
       validRows: [],
       missingRequiredColumns: ['Tệp không có dữ liệu (cần ít nhất 1 dòng tiêu đề và 1 dòng dữ liệu)'],
@@ -491,8 +711,35 @@ export function validateAndPreviewImport(
     };
   }
 
-  const headers = rows[0];
-  const dataRows = rows.slice(1).filter((r) => r.some((cell) => cell.trim() !== ''));
+  const headerRowIndex = detectHeaderRowIndex(rows, datasetKind);
+  const headers = rows[headerRowIndex] || [];
+  const indexedDataRows = rows
+    .slice(headerRowIndex + 1)
+    .map((row, offset) => ({ row, excelRowNumber: headerRowIndex + 2 + offset }))
+    .filter((entry) => entry.row.some((cell) => cell.trim() !== ''));
+
+  if (indexedDataRows.length === 0) {
+    return {
+      datasetKind,
+      fileName,
+      selectedSheetName: sourceMeta.selectedSheetName,
+      detectedHeaderRowNumber: headerRowIndex + 1,
+      totalRows: 0,
+      validRows: [],
+      missingRequiredColumns: ['Không có dòng dữ liệu nào sau dòng tiêu đề.'],
+      duplicateCodes: [],
+      issues: [
+        {
+          rowNumber: headerRowIndex + 1,
+          severity: 'error',
+          field: 'Tệp dữ liệu',
+          message: 'Tệp không chứa dòng dữ liệu hợp lệ nào sau dòng tiêu đề.',
+        },
+      ],
+      canCommit: false,
+    };
+  }
+
   const issues: ValidationRowIssue[] = [];
   const duplicateCodes: string[] = [];
   const seenCodes = new Set<string>();
@@ -500,37 +747,79 @@ export function validateAndPreviewImport(
 
   if (datasetKind === 'state_price') {
     const colCode = findColumnIndex(headers, ['ma_du_lieu', 'recordcode', 'mã dữ liệu', 'ma', 'code']);
-    const colDoc = findColumnIndex(headers, ['van_ban_phap_ly', 'legaldocumentname', 'tên văn bản pháp lý', 'van ban']);
-    const colWard = findColumnIndex(headers, ['xa_phuong', 'wardcommune', 'xã/phường', 'xa phuong', 'phuong']);
-    const colDistrict = findColumnIndex(headers, ['huyen_tp', 'districtcity', 'huyện/thị xã/tp', 'quan huyen', 'huyen']);
-    const colStreet = findColumnIndex(headers, ['tuyen_duong', 'streetname', 'tuyến đường', 'ten duong']);
+    const colDoc = findColumnIndex(headers, [
+      'van_ban_phap_ly',
+      'legaldocumentname',
+      'tên văn bản pháp lý',
+      'tai_lieu_nguon',
+      'van ban',
+    ]);
+    const colDocNumber = findColumnIndex(headers, ['so_nq_bc', 'so_nghi_quyet', 'so_van_ban']);
+    const colWard = findColumnIndex(headers, [
+      'xa_phuong',
+      'xa_thi_tran',
+      'wardcommune',
+      'xã/phường',
+      'xa phuong',
+      'phuong',
+    ]);
+    const colDistrict = findColumnIndex(headers, [
+      'huyen_tp',
+      'dia_ban_tai_lieu',
+      'districtcity',
+      'huyện/thị xã/tp',
+      'quan huyen',
+      'huyen',
+    ]);
+    const colStreet = findColumnIndex(headers, [
+      'tuyen_duong',
+      'ten_duong',
+      'streetname',
+      'tuyến đường',
+      'ten duong',
+    ]);
     const colSegment = findColumnIndex(headers, ['doan_duong', 'roadsegment', 'đoạn đường']);
     const colStart = findColumnIndex(headers, ['diem_dau', 'startpoint', 'điểm đầu']);
     const colEnd = findColumnIndex(headers, ['diem_cuoi', 'endpoint', 'điểm cuối']);
     const colLandType = findColumnIndex(headers, ['loai_dat', 'landtype', 'loại đất']);
     const colPos = findColumnIndex(headers, ['vi_tri', 'position', 'vị trí']);
     const colPrice = findColumnIndex(headers, ['don_gia', 'unitprice', 'đơn giá', 'gia dat']);
-    const colUnit = findColumnIndex(headers, ['don_vi_tinh', 'unit', 'đơn vị tính', 'don vi']);
-    const colPage = findColumnIndex(headers, ['trang_phu_luc', 'sourcepageorappendix', 'trang/phụ lục nguồn', 'trang nguon', 'phu luc']);
-    const colEff = findColumnIndex(headers, ['ngay_hieu_luc', 'effectivedate', 'ngày hiệu lực']);
+    const colUnit = findColumnIndex(headers, ['don_vi_tinh', 'dvt_goc', 'unit', 'đơn vị tính', 'don vi']);
+    const colPage = findColumnIndex(headers, [
+      'trang_phu_luc',
+      'sourcepageorappendix',
+      'trang/phụ lục nguồn',
+      'trang nguon',
+      'phu luc',
+    ]);
+    const colSection = findColumnIndex(headers, ['dieu_khoan_muc', 'muc_phu_luc']);
+    const colPdfPage = findColumnIndex(headers, ['trang_pdf', 'so_trang']);
+    const colOrigStt = findColumnIndex(headers, ['stt_goc', 'stt']);
+    const colEff = findColumnIndex(headers, [
+      'ngay_hieu_luc',
+      'thoi_diem',
+      'effectivedate',
+      'ngày hiệu lực',
+    ]);
     const colLat = findColumnIndex(headers, ['vi_do', 'latitude', 'vĩ độ', 'lat']);
     const colLng = findColumnIndex(headers, ['kinh_do', 'longitude', 'kinh độ', 'lng', 'lon']);
     const colCoordNote = findColumnIndex(headers, ['ghi_chu_toa_do', 'coordinatenote', 'ghi chú tọa độ']);
 
+    const hasProvenanceCol = colPage !== -1 || colPdfPage !== -1 || colSection !== -1;
+
     const missingCols: string[] = [];
     if (colCode === -1) missingCols.push('Mã dữ liệu (ma_du_lieu)');
-    if (colWard === -1) missingCols.push('Xã/Phường (xa_phuong)');
-    if (colStreet === -1) missingCols.push('Tuyến đường (tuyen_duong)');
+    if (colWard === -1) missingCols.push('Xã/Phường/Thị trấn (xa_phuong / xa_thi_tran)');
+    if (colStreet === -1) missingCols.push('Tuyến đường (tuyen_duong / ten_duong)');
     if (colLandType === -1) missingCols.push('Loại đất (loai_dat)');
     if (colPos === -1) missingCols.push('Vị trí (vi_tri)');
     if (colPrice === -1) missingCols.push('Đơn giá (don_gia)');
-    if (colPage === -1) missingCols.push('Trang/Phụ lục nguồn (trang_phu_luc)');
+    if (!hasProvenanceCol) missingCols.push('Trang/Phụ lục nguồn (trang_phu_luc / trang_pdf)');
 
     const validRows: StateLandPriceRecord[] = [];
     let validSpatialCount = 0;
     if (missingCols.length === 0) {
-      dataRows.forEach((row, idx) => {
-        const rowNumber = idx + 2;
+      indexedDataRows.forEach(({ row, excelRowNumber: rowNumber }, idx) => {
         const code = (row[colCode] || '').trim();
         const ward = (row[colWard] || '').trim();
         const street = (row[colStreet] || '').trim();
@@ -538,7 +827,19 @@ export function validateAndPreviewImport(
         const position = (row[colPos] || '').trim();
         const priceRes = parseVietnameseNumber(row[colPrice] || '', 'currency_integer');
         const price = priceRes.value;
-        const page = (row[colPage] || '').trim();
+        const page = composeProvenanceDetail(
+          colPage !== -1 ? row[colPage] || '' : '',
+          colSection !== -1 ? row[colSection] || '' : '',
+          colPdfPage !== -1 ? row[colPdfPage] || '' : '',
+          colOrigStt !== -1 ? row[colOrigStt] || '' : ''
+        );
+
+        const rawDoc = colDoc !== -1 ? (row[colDoc] || '').trim() : '';
+        const rawDocNum = colDocNumber !== -1 ? (row[colDocNumber] || '').trim() : '';
+        const legalDocName =
+          rawDocNum && rawDoc && !rawDoc.includes(rawDocNum)
+            ? `${rawDocNum} (${rawDoc})`
+            : rawDoc || rawDocNum || sourceMeta.sourceDocumentName.trim();
 
         let rowHasError = false;
         if (!code) {
@@ -552,8 +853,18 @@ export function validateAndPreviewImport(
           seenCodes.add(code);
         }
 
+        if (hasDemoMarkerText(code) || hasDemoMarkerText(legalDocName) || hasDemoMarkerText(street)) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Nguồn gốc',
+            message: 'Không được phép nạp bản ghi chứa dấu hiệu [DEMO] vào kho dữ liệu chính thức.',
+          });
+          rowHasError = true;
+        }
+
         if (!ward) {
-          issues.push({ rowNumber, severity: 'error', field: 'Xã/Phường', message: 'Thiếu Xã/Phường.' });
+          issues.push({ rowNumber, severity: 'error', field: 'Xã/Phường', message: 'Thiếu Xã/Phường/Thị trấn.' });
           rowHasError = true;
         }
         if (!street) {
@@ -581,6 +892,26 @@ export function validateAndPreviewImport(
           issues.push({ rowNumber, severity: 'error', field: 'Trang/Phụ lục nguồn', message: 'Thiếu trang hoặc phụ lục nguồn.' });
           rowHasError = true;
         }
+        if (!legalDocName) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Văn bản pháp lý',
+            message: 'Thiếu tên văn bản pháp lý nguồn (điền trong cột van_ban_phap_ly/tai_lieu_nguon hoặc ô Tên tài liệu nguồn).',
+          });
+          rowHasError = true;
+        }
+
+        const effectiveDateVal =
+          (colEff !== -1 && row[colEff] ? row[colEff].trim() : '') || sourceMeta.effectiveDate.trim();
+        if (!effectiveDateVal) {
+          issues.push({
+            rowNumber,
+            severity: 'warning',
+            field: 'Ngày hiệu lực',
+            message: 'Chưa ghi ngày hiệu lực của bảng giá đất Nhà nước.',
+          });
+        }
 
         const coords = parseOptionalSpatialCoordinates(
           colLat !== -1 ? row[colLat] || '' : '',
@@ -596,23 +927,30 @@ export function validateAndPreviewImport(
           if (coords.latitude !== null && coords.longitude !== null) {
             validSpatialCount += 1;
           }
+          const startPoint = colStart !== -1 && !isPlaceholderDash(row[colStart] || '') ? row[colStart].trim() : '';
+          const endPoint = colEnd !== -1 && !isPlaceholderDash(row[colEnd] || '') ? row[colEnd].trim() : '';
+          const roadSegment = composeRoadSegment(
+            colSegment !== -1 ? row[colSegment] || '' : '',
+            startPoint,
+            endPoint
+          );
+
           validRows.push({
             id: `state-${sourceMeta.versionId}-${idx + 1}`,
             recordCode: code,
-            legalDocumentName:
-              (colDoc !== -1 ? row[colDoc] : '') || sourceMeta.sourceDocumentName || 'Chưa ghi tên văn bản pháp lý',
+            legalDocumentName: legalDocName,
             wardCommune: ward,
-            districtCity: colDistrict !== -1 ? row[colDistrict] || '' : '',
+            districtCity: colDistrict !== -1 ? (row[colDistrict] || '').trim() : '',
             streetName: street,
-            roadSegment: colSegment !== -1 ? row[colSegment] || '' : '',
-            startPoint: colStart !== -1 ? row[colStart] || '' : '',
-            endPoint: colEnd !== -1 ? row[colEnd] || '' : '',
+            roadSegment,
+            startPoint,
+            endPoint,
             landType,
             position,
             unitPrice: price,
-            unit: (colUnit !== -1 && row[colUnit]) ? row[colUnit] : 'VNĐ/m²',
+            unit: colUnit !== -1 && row[colUnit] ? row[colUnit].trim() : 'VNĐ/m²',
             sourcePageOrAppendix: page,
-            effectiveDate: (colEff !== -1 && row[colEff]) ? row[colEff] : sourceMeta.effectiveDate,
+            effectiveDate: effectiveDateVal,
             importedAt: nowIso,
             versionId: sourceMeta.versionId,
             latitude: coords.latitude,
@@ -628,7 +966,9 @@ export function validateAndPreviewImport(
     return {
       datasetKind,
       fileName,
-      totalRows: dataRows.length,
+      selectedSheetName: sourceMeta.selectedSheetName,
+      detectedHeaderRowNumber: headerRowIndex + 1,
+      totalRows: indexedDataRows.length,
       validRows,
       validSpatialCount,
       missingRequiredColumns: missingCols,
@@ -640,39 +980,87 @@ export function validateAndPreviewImport(
 
   if (datasetKind === 'ecovis') {
     const colCode = findColumnIndex(headers, ['ma_du_lieu', 'recordcode', 'mã dữ liệu', 'ma', 'code']);
-    const colWard = findColumnIndex(headers, ['xa_phuong', 'wardcommune', 'xã/phường']);
-    const colDistrict = findColumnIndex(headers, ['huyen_tp', 'districtcity', 'huyện/thị xã/tp']);
-    const colStreet = findColumnIndex(headers, ['tuyen_duong', 'streetname', 'tuyến đường']);
+    const colWard = findColumnIndex(headers, ['xa_phuong', 'xa_thi_tran', 'wardcommune', 'xã/phường']);
+    const colDistrict = findColumnIndex(headers, [
+      'huyen_tp',
+      'dia_ban_tai_lieu',
+      'districtcity',
+      'huyện/thị xã/tp',
+    ]);
+    const colStreet = findColumnIndex(headers, ['tuyen_duong', 'ten_duong', 'streetname', 'tuyến đường']);
     const colSegment = findColumnIndex(headers, ['doan_duong', 'roadsegment', 'đoạn đường']);
+    const colStart = findColumnIndex(headers, ['diem_dau', 'startpoint', 'điểm đầu']);
+    const colEnd = findColumnIndex(headers, ['diem_cuoi', 'endpoint', 'điểm cuối']);
     const colLandType = findColumnIndex(headers, ['loai_dat', 'landtype', 'loại đất']);
     const colPos = findColumnIndex(headers, ['vi_tri', 'position', 'vị trí']);
-    const colPrice = findColumnIndex(headers, ['don_gia_khao_sat', 'surveyunitprice', 'đơn giá khảo sát', 'don_gia', 'đơn giá']);
-    const colUnit = findColumnIndex(headers, ['don_vi_tinh', 'unit', 'đơn vị tính']);
-    const colDoc = findColumnIndex(headers, ['nguon_tai_lieu', 'sourcedocument', 'nguồn tài liệu']);
-    const colPage = findColumnIndex(headers, ['phu_luc_trang', 'appendixandpage', 'phụ lục và trang tham chiếu', 'trang']);
-    const colSurveyDate = findColumnIndex(headers, ['thoi_diem_khao_sat', 'surveyorreportdate', 'thời điểm khảo sát', 'ngay_bao_cao']);
+    const colPrice = findColumnIndex(headers, [
+      'don_gia_khao_sat',
+      'surveyunitprice',
+      'đơn giá khảo sát',
+      'don_gia',
+      'đơn giá',
+    ]);
+    const colUnit = findColumnIndex(headers, ['don_vi_tinh', 'dvt_goc', 'unit', 'đơn vị tính']);
+    const colDoc = findColumnIndex(headers, [
+      'nguon_tai_lieu',
+      'tai_lieu_nguon',
+      'sourcedocument',
+      'nguồn tài liệu',
+    ]);
+    const colDocNumber = findColumnIndex(headers, ['so_nq_bc', 'so_bao_cao']);
+    const colPage = findColumnIndex(headers, [
+      'phu_luc_trang',
+      'appendixandpage',
+      'phụ lục và trang tham chiếu',
+      'trang_phu_luc',
+    ]);
+    const colSection = findColumnIndex(headers, ['dieu_khoan_muc', 'phu_luc']);
+    const colPdfPage = findColumnIndex(headers, ['trang_pdf', 'trang']);
+    const colOrigStt = findColumnIndex(headers, ['stt_goc', 'stt']);
+    const colSurveyDate = findColumnIndex(headers, [
+      'thoi_diem_khao_sat',
+      'thoi_diem',
+      'surveyorreportdate',
+      'thời điểm khảo sát',
+      'ngay_bao_cao',
+    ]);
     const colLat = findColumnIndex(headers, ['vi_do', 'latitude', 'vĩ độ', 'lat']);
     const colLng = findColumnIndex(headers, ['kinh_do', 'longitude', 'kinh độ', 'lng', 'lon']);
     const colCoordNote = findColumnIndex(headers, ['ghi_chu_toa_do', 'coordinatenote', 'ghi chú tọa độ']);
 
+    const hasProvenanceCol = colPage !== -1 || colPdfPage !== -1 || colSection !== -1;
+
     const missingCols: string[] = [];
     if (colCode === -1) missingCols.push('Mã dữ liệu (ma_du_lieu)');
-    if (colStreet === -1) missingCols.push('Tuyến đường (tuyen_duong)');
+    if (colStreet === -1) missingCols.push('Tuyến đường (tuyen_duong / ten_duong)');
     if (colLandType === -1) missingCols.push('Loại đất (loai_dat)');
-    if (colPrice === -1) missingCols.push('Đơn giá khảo sát (don_gia_khao_sat)');
-    if (colPage === -1) missingCols.push('Phụ lục và trang tham chiếu (phu_luc_trang)');
+    if (colPrice === -1) missingCols.push('Đơn giá khảo sát (don_gia_khao_sat / don_gia)');
+    if (!hasProvenanceCol) missingCols.push('Phụ lục và trang tham chiếu (phu_luc_trang / trang_pdf)');
 
     const validRows: EcovisRecord[] = [];
     let validSpatialCount = 0;
     if (missingCols.length === 0) {
-      dataRows.forEach((row, idx) => {
-        const rowNumber = idx + 2;
+      indexedDataRows.forEach(({ row, excelRowNumber: rowNumber }, idx) => {
         const code = (row[colCode] || '').trim();
         const street = (row[colStreet] || '').trim();
         const landType = (row[colLandType] || '').trim();
         const priceRes = parseVietnameseNumber(row[colPrice] || '', 'currency_integer');
         const price = priceRes.value;
-        const page = (row[colPage] || '').trim();
+        const page = composeProvenanceDetail(
+          colPage !== -1 ? row[colPage] || '' : '',
+          colSection !== -1 ? row[colSection] || '' : '',
+          colPdfPage !== -1 ? row[colPdfPage] || '' : '',
+          colOrigStt !== -1 ? row[colOrigStt] || '' : ''
+        );
+
+        const rawDoc = colDoc !== -1 ? (row[colDoc] || '').trim() : '';
+        const rawDocNum = colDocNumber !== -1 ? (row[colDocNumber] || '').trim() : '';
+        const sourceDocument =
+          rawDoc || (rawDocNum ? `Báo cáo ECOVIS ${rawDocNum}` : '') || sourceMeta.sourceDocumentName.trim();
+        const surveyDateVal =
+          (colSurveyDate !== -1 && row[colSurveyDate] ? row[colSurveyDate].trim() : '') ||
+          sourceMeta.effectiveDate.trim();
+        const wardVal = colWard !== -1 ? (row[colWard] || '').trim() : '';
 
         let rowHasError = false;
         if (!code) {
@@ -685,6 +1073,17 @@ export function validateAndPreviewImport(
         } else {
           seenCodes.add(code);
         }
+
+        if (hasDemoMarkerText(code) || hasDemoMarkerText(sourceDocument) || hasDemoMarkerText(street)) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Nguồn gốc',
+            message: 'Không được phép nạp bản ghi chứa dấu hiệu [DEMO] vào kho dữ liệu ECOVIS chính thức.',
+          });
+          rowHasError = true;
+        }
+
         if (!street) {
           issues.push({ rowNumber, severity: 'error', field: 'Tuyến đường', message: 'Thiếu Tuyến đường.' });
           rowHasError = true;
@@ -702,9 +1101,34 @@ export function validateAndPreviewImport(
           });
           rowHasError = true;
         }
+        if (!sourceDocument) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Nguồn tài liệu ECOVIS',
+            message: 'Thiếu trích dẫn nguồn báo cáo ECOVIS (nguon_tai_lieu / tai_lieu_nguon hoặc ô Tên tài liệu nguồn).',
+          });
+          rowHasError = true;
+        }
         if (!page) {
           issues.push({ rowNumber, severity: 'error', field: 'Phụ lục & trang', message: 'Thiếu phụ lục và trang tham chiếu.' });
           rowHasError = true;
+        }
+        if (!surveyDateVal) {
+          issues.push({
+            rowNumber,
+            severity: 'warning',
+            field: 'Thời điểm khảo sát',
+            message: 'Chưa ghi thời điểm khảo sát/báo cáo ECOVIS (lưu ý: dữ liệu ECOVIS mang tính tham chiếu theo thời điểm khảo sát, không mặc định là giá hiện hành).',
+          });
+        }
+        if (!wardVal) {
+          issues.push({
+            rowNumber,
+            severity: 'warning',
+            field: 'Xã/Phường',
+            message: 'Thiếu thông tin Xã/Phường/Thị trấn; nên bổ sung để đối chiếu chính xác theo địa bàn.',
+          });
         }
 
         const coords = parseOptionalSpatialCoordinates(
@@ -721,22 +1145,26 @@ export function validateAndPreviewImport(
           if (coords.latitude !== null && coords.longitude !== null) {
             validSpatialCount += 1;
           }
+          const roadSegment = composeRoadSegment(
+            colSegment !== -1 ? row[colSegment] || '' : '',
+            colStart !== -1 ? row[colStart] || '' : '',
+            colEnd !== -1 ? row[colEnd] || '' : ''
+          );
+
           validRows.push({
             id: `eco-${sourceMeta.versionId}-${idx + 1}`,
             recordCode: code,
-            wardCommune: colWard !== -1 ? row[colWard] || '' : '',
-            districtCity: colDistrict !== -1 ? row[colDistrict] || '' : '',
+            wardCommune: wardVal,
+            districtCity: colDistrict !== -1 ? (row[colDistrict] || '').trim() : '',
             streetName: street,
-            roadSegment: colSegment !== -1 ? row[colSegment] || '' : '',
+            roadSegment,
             landType,
-            position: colPos !== -1 ? row[colPos] || '' : 'Chưa ghi rõ',
+            position: colPos !== -1 && row[colPos] ? row[colPos].trim() : 'Chưa ghi rõ',
             surveyUnitPrice: price,
-            unit: colUnit !== -1 && row[colUnit] ? row[colUnit] : 'VNĐ/m²',
-            sourceDocument:
-              (colDoc !== -1 ? row[colDoc] : '') || sourceMeta.sourceDocumentName || 'Báo cáo khảo sát ECOVIS',
+            unit: colUnit !== -1 && row[colUnit] ? row[colUnit].trim() : 'VNĐ/m²',
+            sourceDocument,
             appendixAndPage: page,
-            surveyOrReportDate:
-              (colSurveyDate !== -1 && row[colSurveyDate]) ? row[colSurveyDate] : sourceMeta.effectiveDate,
+            surveyOrReportDate: surveyDateVal,
             importedAt: nowIso,
             versionId: sourceMeta.versionId,
             latitude: coords.latitude,
@@ -752,7 +1180,9 @@ export function validateAndPreviewImport(
     return {
       datasetKind,
       fileName,
-      totalRows: dataRows.length,
+      selectedSheetName: sourceMeta.selectedSheetName,
+      detectedHeaderRowNumber: headerRowIndex + 1,
+      totalRows: indexedDataRows.length,
       validRows,
       validSpatialCount,
       missingRequiredColumns: missingCols,
@@ -769,9 +1199,9 @@ export function validateAndPreviewImport(
     const colFormula = findColumnIndex(headers, ['cong_thuc', 'formula', 'công thức']);
     const colCond = findColumnIndex(headers, ['dieu_kien_ap_dung', 'applicablecondition', 'điều kiện áp dụng']);
     const colInputs = findColumnIndex(headers, ['du_lieu_dau_vao', 'requiredinputfields', 'dữ liệu đầu vào']);
-    const colDoc = findColumnIndex(headers, ['nguon_tai_lieu', 'sourcedocument', 'nguồn tài liệu']);
+    const colDoc = findColumnIndex(headers, ['nguon_tai_lieu', 'tai_lieu_nguon', 'sourcedocument', 'nguồn tài liệu']);
     const colPage = findColumnIndex(headers, ['trang_tham_chieu', 'sourcepage', 'trang tham chiếu', 'trang']);
-    const colEff = findColumnIndex(headers, ['ngay_hieu_luc', 'effectivedate', 'ngày hiệu lực']);
+    const colEff = findColumnIndex(headers, ['ngay_hieu_luc', 'thoi_diem', 'effectivedate', 'ngày hiệu lực']);
 
     const missingCols: string[] = [];
     if (colCode === -1) missingCols.push('Mã hệ số (ma_he_so)');
@@ -783,8 +1213,7 @@ export function validateAndPreviewImport(
 
     const validRows: KFactorRuleRecord[] = [];
     if (missingCols.length === 0) {
-      dataRows.forEach((row, idx) => {
-        const rowNumber = idx + 2;
+      indexedDataRows.forEach(({ row, excelRowNumber: rowNumber }, idx) => {
         const code = (row[colCode] || '').trim();
         const name = (row[colName] || '').trim();
         const valRes = parseVietnameseNumber(row[colVal] || '', 'decimal_measurement');
@@ -792,6 +1221,8 @@ export function validateAndPreviewImport(
         const formula = (row[colFormula] || '').trim();
         const cond = (row[colCond] || '').trim();
         const page = (row[colPage] || '').trim();
+        const sourceDoc =
+          (colDoc !== -1 ? (row[colDoc] || '').trim() : '') || sourceMeta.sourceDocumentName.trim();
 
         let rowHasError = false;
         if (!code) {
@@ -803,6 +1234,15 @@ export function validateAndPreviewImport(
           rowHasError = true;
         } else {
           seenCodes.add(code);
+        }
+        if (hasDemoMarkerText(code) || hasDemoMarkerText(name) || hasDemoMarkerText(sourceDoc)) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Nguồn gốc',
+            message: 'Không được phép nạp quy định Hệ số K chứa dấu hiệu [DEMO] vào kho dữ liệu chính thức.',
+          });
+          rowHasError = true;
         }
         if (!name) {
           issues.push({ rowNumber, severity: 'error', field: 'Tên hệ số', message: 'Thiếu tên hệ số.' });
@@ -829,6 +1269,15 @@ export function validateAndPreviewImport(
           issues.push({ rowNumber, severity: 'error', field: 'Trang tham chiếu', message: 'Thiếu trang tham chiếu nguồn.' });
           rowHasError = true;
         }
+        if (!sourceDoc) {
+          issues.push({
+            rowNumber,
+            severity: 'error',
+            field: 'Nguồn tài liệu',
+            message: 'Thiếu tên văn bản/quy định nguồn của Hệ số K.',
+          });
+          rowHasError = true;
+        }
 
         if (!rowHasError && val !== null) {
           validRows.push({
@@ -838,11 +1287,10 @@ export function validateAndPreviewImport(
             factorValue: val,
             formula,
             applicableCondition: cond,
-            requiredInputFields: colInputs !== -1 ? row[colInputs] || '' : '',
-            sourceDocument:
-              (colDoc !== -1 ? row[colDoc] : '') || sourceMeta.sourceDocumentName || 'Tài liệu quy định hệ số K',
+            requiredInputFields: colInputs !== -1 ? (row[colInputs] || '').trim() : '',
+            sourceDocument: sourceDoc,
             sourcePage: page,
-            effectiveDate: (colEff !== -1 && row[colEff]) ? row[colEff] : sourceMeta.effectiveDate,
+            effectiveDate: (colEff !== -1 && row[colEff] ? row[colEff].trim() : '') || sourceMeta.effectiveDate.trim(),
             importedAt: nowIso,
             versionId: sourceMeta.versionId,
             isDemo: false,
@@ -855,7 +1303,9 @@ export function validateAndPreviewImport(
     return {
       datasetKind,
       fileName,
-      totalRows: dataRows.length,
+      selectedSheetName: sourceMeta.selectedSheetName,
+      detectedHeaderRowNumber: headerRowIndex + 1,
+      totalRows: indexedDataRows.length,
       validRows,
       missingRequiredColumns: missingCols,
       duplicateCodes: Array.from(new Set(duplicateCodes)),
@@ -864,18 +1314,19 @@ export function validateAndPreviewImport(
     };
   }
 
-  // market_survey
+  // market_survey (M3: strict source, date, location & asking-price status validation)
   const colCode = findColumnIndex(headers, ['ma_tin', 'listingcode', 'mã tin', 'ma_du_lieu']);
   const colSource = findColumnIndex(headers, ['nguon_tin', 'sourcename', 'nguồn tin']);
   const colUrl = findColumnIndex(headers, ['duong_dan', 'đường dẫn', 'url', 'link']);
-  const colDate = findColumnIndex(headers, ['ngay_dang', 'posteddate', 'ngày đăng']);
+  const colDate = findColumnIndex(headers, ['ngay_dang', 'posteddate', 'ngày đăng', 'ngay_khao_sat', 'thoi_diem']);
   const colAddress = findColumnIndex(headers, ['dia_chi', 'address', 'địa chỉ']);
-  const colWard = findColumnIndex(headers, ['xa_phuong', 'wardcommune', 'xã/phường']);
+  const colWard = findColumnIndex(headers, ['xa_phuong', 'xa_thi_tran', 'wardcommune', 'xã/phường']);
   const colArea = findColumnIndex(headers, ['dien_tich', 'areasqm', 'diện tích']);
   const colPrice = findColumnIndex(headers, ['gia_rao_ban', 'askingpricevnd', 'giá rao bán']);
   const colType = findColumnIndex(headers, ['loai_bds', 'propertytype', 'loại bất động sản']);
   const colLoc = findColumnIndex(headers, ['thong_tin_vi_tri', 'locationinfo', 'thông tin vị trí']);
-  const colNote = findColumnIndex(headers, ['ghi_chu_xac_minh', 'verificationnote', 'ghi chú xác minh']);
+  const colPriceStatus = findColumnIndex(headers, ['trang_thai_gia', 'loai_gia', 'price_status', 'tinh_chat_gia']);
+  const colNote = findColumnIndex(headers, ['ghi_chu_xac_minh', 'verificationnote', 'ghi chú xác minh', 'ghi_chu']);
   const colLat = findColumnIndex(headers, ['vi_do', 'latitude', 'vĩ độ', 'lat']);
   const colLng = findColumnIndex(headers, ['kinh_do', 'longitude', 'kinh độ', 'lng', 'lon']);
   const colCoordNote = findColumnIndex(headers, ['ghi_chu_toa_do', 'coordinatenote', 'ghi chú tọa độ']);
@@ -883,22 +1334,27 @@ export function validateAndPreviewImport(
   const missingCols: string[] = [];
   if (colCode === -1) missingCols.push('Mã tin (ma_tin)');
   if (colSource === -1) missingCols.push('Nguồn tin (nguon_tin)');
-  if (colAddress === -1) missingCols.push('Địa chỉ (dia_chi)');
+  if (colDate === -1) missingCols.push('Ngày đăng / Ngày khảo sát (ngay_dang)');
+  if (colAddress === -1) missingCols.push('Địa chỉ bất động sản (dia_chi)');
   if (colArea === -1) missingCols.push('Diện tích m² (dien_tich)');
   if (colPrice === -1) missingCols.push('Giá rao bán VNĐ (gia_rao_ban)');
 
-  const validRows: MarketListingRecord[] = [];
+  const rawValidRows: MarketListingRecord[] = [];
+  const validRowNumbers: number[] = [];
   let validSpatialCount = 0;
   if (missingCols.length === 0) {
-    dataRows.forEach((row, idx) => {
-      const rowNumber = idx + 2;
+    indexedDataRows.forEach(({ row, excelRowNumber: rowNumber }, idx) => {
       const code = (row[colCode] || '').trim();
       const source = (row[colSource] || '').trim();
+      const postedDate = (row[colDate] || '').trim();
       const address = (row[colAddress] || '').trim();
+      const ward = colWard !== -1 ? (row[colWard] || '').trim() : '';
       const areaRes = parseVietnameseNumber(row[colArea] || '', 'decimal_measurement');
       const priceRes = parseVietnameseNumber(row[colPrice] || '', 'currency_integer');
       const area = areaRes.value;
       const price = priceRes.value;
+      const priceStatusText = colPriceStatus !== -1 ? (row[colPriceStatus] || '').trim() : '';
+      const rawNote = colNote !== -1 ? (row[colNote] || '').trim() : '';
 
       let rowHasError = false;
       if (!code) {
@@ -911,13 +1367,49 @@ export function validateAndPreviewImport(
       } else {
         seenCodes.add(code);
       }
+
+      if (hasDemoMarkerText(code) || hasDemoMarkerText(source) || hasDemoMarkerText(address)) {
+        issues.push({
+          rowNumber,
+          severity: 'error',
+          field: 'Nguồn gốc',
+          message: 'Không được phép nạp tin rao chứa dấu hiệu [DEMO] vào kho dữ liệu thị trường chính thức.',
+        });
+        rowHasError = true;
+      }
+
       if (!source) {
-        issues.push({ rowNumber, severity: 'error', field: 'Nguồn tin', message: 'Thiếu nguồn tin.' });
+        issues.push({ rowNumber, severity: 'error', field: 'Nguồn tin', message: 'Thiếu nguồn tin khảo sát.' });
+        rowHasError = true;
+      }
+      if (!postedDate) {
+        issues.push({
+          rowNumber,
+          severity: 'error',
+          field: 'Ngày đăng',
+          message: 'Thiếu ngày đăng / ngày khảo sát (bắt buộc để kiểm soát tính thời điểm của giá rao bán).',
+        });
+        rowHasError = true;
+      } else if (!isValidMarketPostedDate(postedDate)) {
+        issues.push({
+          rowNumber,
+          severity: 'error',
+          field: 'Ngày đăng',
+          message: `Ngày đăng "${postedDate}" không đúng định dạng hợp lệ (dùng YYYY-MM-DD hoặc DD/MM/YYYY).`,
+        });
         rowHasError = true;
       }
       if (!address) {
         issues.push({ rowNumber, severity: 'error', field: 'Địa chỉ', message: 'Thiếu địa chỉ bất động sản.' });
         rowHasError = true;
+      }
+      if (!ward) {
+        issues.push({
+          rowNumber,
+          severity: 'warning',
+          field: 'Xã/Phường',
+          message: 'Thiếu Xã/Phường/Thị trấn; đề nghị bổ sung để phân loại đúng vị trí và lân cận.',
+        });
       }
       if (area === null || area <= 0) {
         issues.push({
@@ -934,6 +1426,17 @@ export function validateAndPreviewImport(
           severity: 'error',
           field: 'Giá rao bán',
           message: priceRes.error || 'Giá rao bán không hợp lệ hoặc <= 0.',
+        });
+        rowHasError = true;
+      }
+
+      if (claimsCompletedTransactionPrice(priceStatusText) || claimsCompletedTransactionPrice(rawNote)) {
+        issues.push({
+          rowNumber,
+          severity: 'error',
+          field: 'Trạng thái giá',
+          message:
+            'Không được coi hoặc gán nhãn tin khảo sát thị trường là giá giao dịch thực tế / đã bán. Tập dữ liệu này chỉ lưu GIÁ RAO BÁN THAM KHẢO.',
         });
         rowHasError = true;
       }
@@ -979,21 +1482,28 @@ export function validateAndPreviewImport(
         if (coords.latitude !== null && coords.longitude !== null) {
           validSpatialCount += 1;
         }
-        validRows.push({
+        const askingStatusPrefix = 'Giá rao bán tham khảo (chưa xác minh – không phải giá giao dịch thực tế)';
+        const combinedNote = rawNote
+          ? rawNote.toLowerCase().includes('rao bán') || rawNote.toLowerCase().includes('không phải giá giao dịch')
+            ? rawNote
+            : `${askingStatusPrefix}. ${rawNote}`
+          : askingStatusPrefix;
+
+        rawValidRows.push({
           id: `mkt-${sourceMeta.versionId}-${idx + 1}`,
           listingCode: code,
           sourceName: source,
           url: safeUrl,
-          postedDate: colDate !== -1 ? row[colDate] || '' : '',
+          postedDate,
           address,
-          wardCommune: colWard !== -1 ? row[colWard] || '' : '',
+          wardCommune: ward,
           areaSqm: area,
           askingPriceVnd: price,
           unitPricePerSqm: Math.round(price / area),
-          propertyType: colType !== -1 ? row[colType] || '' : 'Chưa phân loại',
-          locationInfo: colLoc !== -1 ? row[colLoc] || '' : '',
+          propertyType: colType !== -1 && row[colType] ? row[colType].trim() : 'Chưa phân loại',
+          locationInfo: colLoc !== -1 ? (row[colLoc] || '').trim() : '',
           verificationStatus: 'chua_xac_minh',
-          verificationNote: colNote !== -1 ? row[colNote] || 'Nhập từ bảng khảo sát – chưa xác minh.' : 'Nhập từ bảng khảo sát – chưa xác minh.',
+          verificationNote: combinedNote,
           isDuplicate: false,
           duplicateOfId: null,
           createdAt: nowIso,
@@ -1002,15 +1512,30 @@ export function validateAndPreviewImport(
           coordinateNote: colCoordNote !== -1 && row[colCoordNote] ? row[colCoordNote].trim() : undefined,
           isDemo: false,
         });
+        validRowNumbers.push(rowNumber);
       }
     });
   }
+
+  const validRows = detectDuplicateMarketListings(rawValidRows);
+  validRows.forEach((rec, i) => {
+    if (rec.isDuplicate) {
+      issues.push({
+        rowNumber: validRowNumbers[i] ?? i + 2,
+        severity: 'warning',
+        field: 'Trùng lặp tin rao',
+        message: `Tin rao "${rec.listingCode}" có dấu hiệu trùng URL hoặc trùng (địa chỉ + diện tích + giá rao bán) với tin trước đó — hệ thống sẽ tự loại khỏi thống kê tổng hợp.`,
+      });
+    }
+  });
 
   const hasBlockingError = missingCols.length > 0 || issues.some((i) => i.severity === 'error');
   return {
     datasetKind,
     fileName,
-    totalRows: dataRows.length,
+    selectedSheetName: sourceMeta.selectedSheetName,
+    detectedHeaderRowNumber: headerRowIndex + 1,
+    totalRows: indexedDataRows.length,
     validRows,
     validSpatialCount,
     missingRequiredColumns: missingCols,
@@ -1149,6 +1674,7 @@ const DATASET_TEMPLATES: Record<
       'gia_rao_ban',
       'loai_bds',
       'thong_tin_vi_tri',
+      'trang_thai_gia',
       'ghi_chu_xac_minh',
       'vi_do',
       'kinh_do',
@@ -1156,15 +1682,16 @@ const DATASET_TEMPLATES: Record<
     ],
     sampleNoteRow: [
       'TT-001',
-      'Tên website hoặc nguồn tin',
-      'https://...',
+      'Tên website hoặc nguồn tin khảo sát',
+      'https://example.vn/tin-rao-mau',
       '2026-02-01',
-      'Phường/Xã',
+      'Phường/Xã/Thị trấn',
       'Địa chỉ bất động sản rao bán',
       100,
       3000000000,
-      'Đất ở đô thị',
+      'Đất ở tại đô thị',
       'Mặt tiền / Hẻm rộng ...m',
+      'Giá rao bán tham khảo (không phải giá giao dịch thực tế)',
       'Chưa xác minh – cần gọi kiểm tra thực tế',
       '',
       '',
@@ -1172,6 +1699,10 @@ const DATASET_TEMPLATES: Record<
     ],
   },
 };
+
+export function getDatasetTemplateSpec(datasetKind: DatasetKind) {
+  return DATASET_TEMPLATES[datasetKind];
+}
 
 export async function downloadExcelTemplate(datasetKind: DatasetKind): Promise<void> {
   const tpl = DATASET_TEMPLATES[datasetKind];
@@ -1481,10 +2012,12 @@ export function buildReportExcelRows(
   } else {
     rows.push([
       cell('Nguồn tin', true),
+      cell('Ngày đăng', true),
       cell('Địa chỉ', true),
       cell('Diện tích (m²)', true),
       cell('Giá rao bán', true),
       cell('Đơn giá/m²', true),
+      cell('Tính chất giá', true),
       cell('Trạng thái xác minh', true),
       cell('Nguồn gốc', true),
       cell('Đường dẫn', true),
@@ -1492,10 +2025,12 @@ export function buildReportExcelRows(
     attachedMarketListings.forEach((m) => {
       rows.push([
         cell(m.sourceName),
+        cell(m.postedDate || 'Chưa ghi ngày'),
         cell(m.address),
         cell(m.areaSqm ?? 'Chưa có'),
         cell(formatCurrencyVnd(m.askingPriceVnd)),
         cell(formatCurrencyVnd(m.unitPricePerSqm)),
+        cell('Giá rao bán tham khảo (không phải giá giao dịch)'),
         cell(
           m.verificationStatus === 'da_xac_minh_so_bo'
             ? 'Đã xác minh sơ bộ'

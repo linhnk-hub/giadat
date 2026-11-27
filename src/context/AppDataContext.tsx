@@ -32,6 +32,7 @@ import {
   isStateRecordDemo,
   validateAttachToDossier,
 } from '../utils/dossierIntegrity';
+import { buildApiUrl } from '../utils/apiClient';
 import { detectDuplicateMarketListings } from '../utils/formatters';
 
 const STORAGE_KEY_DATASETS = 'khanh_hoa_land_real_datasets_v1';
@@ -268,7 +269,7 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const refreshServerDatasets = useCallback(async () => {
     try {
-      const response = await fetch('/api/datasets/active', { cache: 'no-store' });
+      const response = await fetch(buildApiUrl('/api/datasets/active'), { cache: 'no-store' });
       if (!response.ok) {
         setServerDatasetStatus('offline');
         return;

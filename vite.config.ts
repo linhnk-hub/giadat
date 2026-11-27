@@ -4,9 +4,23 @@ import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
+function resolveViteBase(rawBase?: string): string {
+  const trimmed = rawBase?.trim();
+  if (!trimmed || trimmed === '/') {
+    return '/';
+  }
+  if (trimmed === './') {
+    return './';
+  }
+  const stripped = trimmed.replace(/^\/+|\/+$/g, '');
+  return stripped ? `/${stripped}/` : '/';
+}
+
 export default defineConfig(() => {
+  const base = resolveViteBase(process.env.VITE_BASE_PATH);
+
   return {
-    base: './',
+    base,
     plugins: [
       react(),
       tailwindcss(),

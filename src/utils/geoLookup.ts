@@ -455,6 +455,60 @@ function sortMatchedItems<T>(items: MatchedLookupItem<T>[]): MatchedLookupItem<T
   });
 }
 
+function isDistrictWideWardLabel(ward: string): boolean {
+  const norm = normalizeVietnameseText(ward).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  return (
+    norm === 'toan huyen' ||
+    norm === 'toan thi xa' ||
+    norm === 'toan thanh pho' ||
+    norm === 'toan tinh' ||
+    norm === 'toan dia ban'
+  );
+}
+
+function isSubAreaDistrictDescriptor(recDistrict: string, recWard: string): boolean {
+  const normDist = normalizeVietnameseText(recDistrict).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!normDist) return true;
+  if (
+    normDist.startsWith('dia ban ') ||
+    normDist.startsWith('doan qua ') ||
+    normDist.startsWith('duong lien xa') ||
+    normDist.startsWith('dat o ven truc') ||
+    normDist.startsWith('truc chinh')
+  ) {
+    return true;
+  }
+  if (recWard && matchNormalizedAdmin(recWard, recDistrict) !== 'none') {
+    return true;
+  }
+  return false;
+}
+
+function classifyBroadLandGroup(landType: string): 'agricultural' | 'residential' | 'other' {
+  const norm = normalizeVietnameseText(landType);
+  if (!norm) return 'other';
+  if (
+    norm.includes('dat o') ||
+    norm.includes('odt') ||
+    norm.includes('ont') ||
+    norm.includes('thuong mai') ||
+    norm.includes('san xuat kinh doanh')
+  ) {
+    return 'residential';
+  }
+  if (
+    norm.includes('nong nghiep') ||
+    norm.includes('trong cay') ||
+    norm.includes('rung') ||
+    norm.includes('thuy san') ||
+    norm.includes('lam muoi') ||
+    norm.includes('lua')
+  ) {
+    return 'agricultural';
+  }
+  return 'other';
+}
+
 function evaluateRecordMatch(params: {
   query: LookupQueryInput;
   hasQueryCoords: boolean;
@@ -516,14 +570,33 @@ function evaluateRecordMatch(params: {
       ? matchNormalizedAdmin(query.landType, recLandType)
       : 'none';
 
+  const queryBroadGroup = classifyBroadLandGroup(query.landType || '');
+  const recBroadGroup = classifyBroadLandGroup(recLandType);
+  const hasBroadLandTypeConflict =
+    queryBroadGroup !== 'other' &&
+    recBroadGroup !== 'other' &&
+    queryBroadGroup !== recBroadGroup;
+
+  const recIsDistrictWide =
+    isDistrictWideWardLabel(recWard) && stripAdminPrefix(recStreet).length === 0;
+
   // If user explicitly provided a ward/commune AND record has a ward/commune AND they clearly conflict
-  // (only applies to pure text matches when no GPS match proves closeness)
+  // (district-wide agricultural tariffs like "Toàn huyện" do not conflict with wards in that district)
   const hasWardConflict =
+    !recIsDistrictWide &&
     stripAdminPrefix(query.wardCommune).length >= 3 &&
     stripAdminPrefix(recWard).length >= 3 &&
     wardMatch === 'none';
 
+  // Only treat recDistrict as a true district conflict when it is NOT a sub-area/ward descriptor
+  // accompanying an already-matched ward (e.g. "Địa bàn Tô Hạp (cũ)" when ward is "Thị trấn Tô Hạp").
+  // When ward does NOT match (e.g. querying TP. Nha Trang against Tô Hạp), conflict stays TRUE so
+  // different districts never leak across each other!
+  const districtIsSubAreaForMatchedWard =
+    wardMatch !== 'none' && isSubAreaDistrictDescriptor(recDistrict, recWard);
+
   const hasDistrictConflict =
+    !districtIsSubAreaForMatchedWard &&
     stripAdminPrefix(query.districtCity).length >= 3 &&
     stripAdminPrefix(recDistrict).length >= 3 &&
     districtMatch === 'none';
@@ -558,6 +631,20 @@ function evaluateRecordMatch(params: {
   const textSameStreetDifferentWard =
     effectiveStreetMatch !== 'none' && hasWardConflict && !hasDistrictConflict;
 
+  // 3. District-wide tariff match (e.g. NQ 15/2025 agricultural land "Toàn huyện", Ten_Duong = "-")
+  const textDistrictWideExact =
+    recIsDistrictWide &&
+    districtMatch !== 'none' &&
+    landTypeMatch !== 'none' &&
+    !hasBroadLandTypeConflict;
+
+  const textDistrictWideNearby =
+    recIsDistrictWide &&
+    districtMatch !== 'none' &&
+    !textDistrictWideExact &&
+    !hasBroadLandTypeConflict &&
+    !stripAdminPrefix(query.streetName);
+
   if (textExactStreet) {
     if (tier !== 'exact_location') {
       tier = 'exact_location';
@@ -573,6 +660,12 @@ function evaluateRecordMatch(params: {
       score += 15;
       reasons.push('Khớp đoạn đường');
     }
+  } else if (textDistrictWideExact) {
+    if (tier !== 'exact_location') {
+      tier = 'exact_location';
+    }
+    score += landTypeMatch === 'exact' ? 85 : 72;
+    reasons.push('Áp dụng toàn huyện theo loại đất & địa bàn hành chính');
   } else if (textSameWardNearby) {
     if (!tier) {
       tier = 'nearby_comparable';
@@ -585,6 +678,12 @@ function evaluateRecordMatch(params: {
     }
     score += 22;
     reasons.push('Cùng tên tuyến đường (khác Xã/Phường – tham chiếu lân cận)');
+  } else if (textDistrictWideNearby) {
+    if (!tier) {
+      tier = 'nearby_comparable';
+    }
+    score += 20;
+    reasons.push('Bảng giá áp dụng toàn huyện (cần đối chiếu đúng loại đất)');
   }
 
   if (!tier) return null;
@@ -595,7 +694,12 @@ function evaluateRecordMatch(params: {
   }
 
   const hasGpsBasis = distanceMeters !== null && distanceMeters <= query.radiusMeters;
-  const hasTextBasis = textExactStreet || textSameWardNearby || textSameStreetDifferentWard;
+  const hasTextBasis =
+    textExactStreet ||
+    textDistrictWideExact ||
+    textSameWardNearby ||
+    textSameStreetDifferentWard ||
+    textDistrictWideNearby;
   const matchType: 'gps_and_text' | 'gps_only' | 'text_only' =
     hasGpsBasis && hasTextBasis ? 'gps_and_text' : hasGpsBasis ? 'gps_only' : 'text_only';
 
