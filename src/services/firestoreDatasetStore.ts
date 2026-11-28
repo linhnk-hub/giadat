@@ -4,7 +4,11 @@ import {
   doc,
   getCountFromServer,
   getDoc,
+  getDocFromCache,
+  getDocFromServer,
   getDocs,
+  getDocsFromCache,
+  getDocsFromServer,
   limit,
   orderBy,
   query,
@@ -120,6 +124,48 @@ export interface FirestoreDatasetRecordDoc {
   createdAt?: FieldValue | Timestamp | string;
 }
 
+export type DatasetLoadSource = 'cache' | 'server' | 'empty';
+
+export type CacheFallbackReason =
+  | 'cache_empty'
+  | 'cache_count_mismatch'
+  | 'cache_validation_failed'
+  | 'cache_query_error'
+  | 'large_dataset_bounded';
+
+export interface DatasetKindLoadDiagnostics {
+  datasetKind: DatasetKind;
+  versionId: string | null;
+  expectedRowCount: number;
+  loadedRowCount: number;
+  source: DatasetLoadSource;
+  fallbackReason?: CacheFallbackReason;
+}
+
+export interface FirestoreDocReadResult {
+  exists: boolean;
+  data: DocumentData | null;
+  fromCache: boolean;
+}
+
+export interface FirestoreQueryReadResult {
+  docs: DocumentData[];
+  fromCache: boolean;
+}
+
+export interface FirestorePublicReadAdapter {
+  getActivePointerFromServer: (kind: DatasetKind) => Promise<FirestoreDocReadResult>;
+  getActivePointerFromCache: (kind: DatasetKind) => Promise<FirestoreDocReadResult>;
+  getActiveRecordsFromCache: (
+    kind: DatasetKind,
+    versionId: string
+  ) => Promise<FirestoreQueryReadResult>;
+  getActiveRecordsFromServer: (
+    kind: DatasetKind,
+    versionId: string
+  ) => Promise<FirestoreQueryReadResult>;
+}
+
 export interface PublicActiveDatasetsSnapshot {
   databaseId: string;
   activePointers: Record<DatasetKind, ActiveVersionPointerDoc | null>;
@@ -130,6 +176,11 @@ export interface PublicActiveDatasetsSnapshot {
   pdfDocuments: PdfReferenceDocument[];
   /** Indicates whether any active dataset has > 500 rows (requires targeted lookup queries) */
   hasLargeDatasetRequiringTargetedQuery: Record<DatasetKind, boolean>;
+  /** Observability metadata describing cache vs. server resolution for each dataset */
+  loadMeta?: {
+    pointerSource: 'server' | 'offline_cache';
+    byKind: Record<DatasetKind, DatasetKindLoadDiagnostics>;
+  };
 }
 
 export interface AdminOverviewSnapshot {
@@ -673,8 +724,311 @@ export async function buildVersionPayloadChecksum(
 }
 
 // =============================================================================
-// PUBLIC READ OPERATIONS (Direct Cloud Firestore Web SDK, 0 PII, Bounded Limits)
+// PUBLIC READ OPERATIONS (Cache-Aware Cloud Firestore Web SDK, 0 PII, Bounded)
 // =============================================================================
+
+export function isFirestoreOfflineError(error: unknown): boolean {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '').toLowerCase()
+      : '';
+  const msg =
+    error instanceof Error ? error.message.toLowerCase() : String(error ?? '').toLowerCase();
+  if (
+    code === 'permission-denied' ||
+    msg.includes('permission-denied') ||
+    msg.includes('missing or insufficient permissions') ||
+    code === 'resource-exhausted' ||
+    msg.includes('resource-exhausted') ||
+    msg.includes('quota')
+  ) {
+    return false;
+  }
+  return (
+    code === 'unavailable' ||
+    msg.includes('client is offline') ||
+    msg.includes('offline') ||
+    msg.includes('unavailable') ||
+    msg.includes('network')
+  );
+}
+
+function parseActivePointerDoc(
+  kind: DatasetKind,
+  d: DocumentData | null
+): ActiveVersionPointerDoc | null {
+  if (!d || typeof d !== 'object') return null;
+  const activeVersionId = String(d.activeVersionId ?? '').trim();
+  const rowCount = Number(d.rowCount ?? 0);
+  if (!activeVersionId || !Number.isInteger(rowCount) || rowCount < 0) {
+    return null;
+  }
+  return {
+    datasetKind: kind,
+    activeVersionId,
+    versionLabel: String(d.versionLabel ?? ''),
+    sourceDocumentName: String(d.sourceDocumentName ?? ''),
+    sourceFileName: String(d.sourceFileName ?? ''),
+    effectiveDate: String(d.effectiveDate ?? ''),
+    importedAt: String(d.importedAt ?? ''),
+    rowCount,
+    spatialRecordsCount: Number(d.spatialRecordsCount ?? 0),
+    notes: String(d.notes ?? ''),
+    lastEventId: String(d.lastEventId ?? ''),
+  };
+}
+
+/**
+ * Validates a single raw Firestore `/dataset_records` document against active datasetKind,
+ * active versionId, public visibility, non-demo integrity, coordinate integrity, and kind schema.
+ */
+export function validateFirestoreRecordDoc(
+  data: unknown,
+  expectedKind: DatasetKind,
+  expectedVersionId: string
+): boolean {
+  if (!data || typeof data !== 'object') return false;
+  const d = data as DocumentData;
+
+  if (d.datasetKind !== expectedKind) return false;
+  if (d.versionId !== expectedVersionId) return false;
+  if (d.visibility !== 'public') return false;
+  if (d.isDemo !== false) return false;
+  if (typeof d.recordId !== 'string' || d.recordId.trim().length === 0) return false;
+  if (typeof d.recordCode !== 'string' || d.recordCode.trim().length === 0) return false;
+  if (typeof d.hasCoordinates !== 'boolean') return false;
+
+  if (d.hasCoordinates) {
+    if (!isValidCoordinatePair(d.latitude, d.longitude)) return false;
+  } else {
+    if (d.latitude !== null || d.longitude !== null) return false;
+  }
+
+  if (!d.payload || typeof d.payload !== 'object') return false;
+  const p = d.payload as Record<string, unknown>;
+
+  if (expectedKind === 'state_price') {
+    const unitPrice = Number(p.unitPrice);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) return false;
+    if (typeof p.wardCommune !== 'string' || p.wardCommune.trim().length === 0) return false;
+    if (typeof p.streetName !== 'string' || p.streetName.trim().length === 0) return false;
+    if (typeof p.legalDocumentName !== 'string' || p.legalDocumentName.trim().length === 0) {
+      return false;
+    }
+    return true;
+  }
+
+  if (expectedKind === 'ecovis') {
+    const surveyUnitPrice = Number(p.surveyUnitPrice);
+    if (!Number.isFinite(surveyUnitPrice) || surveyUnitPrice <= 0) return false;
+    if (typeof p.sourceDocument !== 'string' || p.sourceDocument.trim().length === 0) return false;
+    if (typeof p.streetName !== 'string' || p.streetName.trim().length === 0) return false;
+    return true;
+  }
+
+  if (expectedKind === 'k_factor_rules') {
+    const factorValue = Number(p.factorValue);
+    if (!Number.isFinite(factorValue) || factorValue <= 0) return false;
+    if (typeof p.factorName !== 'string' || p.factorName.trim().length === 0) return false;
+    if (typeof p.sourceDocument !== 'string' || p.sourceDocument.trim().length === 0) return false;
+    return true;
+  }
+
+  // market_survey
+  if (typeof p.sourceName !== 'string' || p.sourceName.trim().length === 0) return false;
+  if (typeof p.postedDate !== 'string' || p.postedDate.trim().length === 0) return false;
+  if (typeof p.address !== 'string' || p.address.trim().length === 0) return false;
+  const areaSqm = Number(p.areaSqm);
+  const askingPriceVnd = Number(p.askingPriceVnd);
+  const unitPricePerSqm = Number(p.unitPricePerSqm);
+  if (!(areaSqm > 0) || !(askingPriceVnd > 0) || !(unitPricePerSqm > 0)) return false;
+  if (typeof p.url === 'string' && p.url.trim().length > 0 && !/^https?:\/\/.+$/i.test(p.url.trim())) {
+    return false;
+  }
+  const normNote = normalizeVietnameseText(String(p.verificationNote ?? ''));
+  if (COMPLETED_TRANSACTION_KEYWORDS.some((kw) => normNote.includes(kw))) return false;
+  return true;
+}
+
+/**
+ * Validates a full cached record set for a given `(kind, activeVersionId, expectedRowCount)`.
+ * Cache is accepted ONLY if:
+ * - count === expectedRowCount (exact match, neither missing nor extra),
+ * - every record matches `kind` and `activeVersionId`,
+ * - every record passes `validateFirestoreRecordDoc`,
+ * - every `recordId` is unique.
+ */
+export function validateCachedRecordSet(
+  docs: readonly DocumentData[],
+  kind: DatasetKind,
+  expectedVersionId: string,
+  expectedRowCount: number
+):
+  | {
+      ok: true;
+      records: Array<
+        StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord
+      >;
+    }
+  | {
+      ok: false;
+      reason: CacheFallbackReason;
+      detail: string;
+    } {
+  if (expectedRowCount > PUBLIC_RECORDS_QUERY_LIMIT) {
+    return {
+      ok: false,
+      reason: 'large_dataset_bounded',
+      detail: `rowCount ${expectedRowCount} vượt giới hạn truy vấn công khai ${PUBLIC_RECORDS_QUERY_LIMIT}`,
+    };
+  }
+  if (docs.length === 0) {
+    return {
+      ok: false,
+      reason: 'cache_empty',
+      detail: `0/${expectedRowCount} bản ghi trong bộ nhớ đệm`,
+    };
+  }
+  if (docs.length !== expectedRowCount) {
+    return {
+      ok: false,
+      reason: 'cache_count_mismatch',
+      detail: `Số bản ghi cache (${docs.length}) không khớp rowCount xác minh (${expectedRowCount})`,
+    };
+  }
+
+  const seenRecordIds = new Set<string>();
+  const records: Array<
+    StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord
+  > = [];
+
+  for (let i = 0; i < docs.length; i += 1) {
+    const raw = docs[i];
+    if (!validateFirestoreRecordDoc(raw, kind, expectedVersionId)) {
+      return {
+        ok: false,
+        reason: 'cache_validation_failed',
+        detail: `Bản ghi cache #${i + 1} không vượt qua kiểm tra hợp lệ cho ${kind}@${expectedVersionId}`,
+      };
+    }
+    const rid = String(raw.recordId);
+    if (seenRecordIds.has(rid)) {
+      return {
+        ok: false,
+        reason: 'cache_validation_failed',
+        detail: `Phát hiện trùng recordId "${rid}" trong bộ nhớ đệm`,
+      };
+    }
+    seenRecordIds.add(rid);
+    records.push(deserializeFirestoreRecordDoc(raw));
+  }
+
+  return { ok: true, records };
+}
+
+function buildActiveRecordsQuery(kind: DatasetKind, activeVersionId: string) {
+  return query(
+    collection(db, FIRESTORE_COLLECTIONS.datasetRecords),
+    where('datasetKind', '==', kind),
+    where('versionId', '==', activeVersionId),
+    where('visibility', '==', 'public'),
+    where('isDemo', '==', false),
+    limit(PUBLIC_RECORDS_QUERY_LIMIT)
+  );
+}
+
+export const defaultFirestorePublicReadAdapter: FirestorePublicReadAdapter = {
+  async getActivePointerFromServer(kind) {
+    const ref = doc(db, FIRESTORE_COLLECTIONS.activeVersions, kind);
+    const snap = await getDocFromServer(ref);
+    return {
+      exists: snap.exists(),
+      data: snap.exists() ? snap.data() : null,
+      fromCache: snap.metadata.fromCache,
+    };
+  },
+  async getActivePointerFromCache(kind) {
+    const ref = doc(db, FIRESTORE_COLLECTIONS.activeVersions, kind);
+    const snap = await getDocFromCache(ref);
+    return {
+      exists: snap.exists(),
+      data: snap.exists() ? snap.data() : null,
+      fromCache: true,
+    };
+  },
+  async getActiveRecordsFromCache(kind, versionId) {
+    const snap = await getDocsFromCache(buildActiveRecordsQuery(kind, versionId));
+    return {
+      docs: snap.docs.map((docSnap) => docSnap.data()),
+      fromCache: true,
+    };
+  },
+  async getActiveRecordsFromServer(kind, versionId) {
+    const snap = await getDocsFromServer(buildActiveRecordsQuery(kind, versionId));
+    return {
+      docs: snap.docs.map((docSnap) => docSnap.data()),
+      fromCache: snap.metadata.fromCache,
+    };
+  },
+};
+
+async function fetchActiveVersionPointersWithMode(
+  adapter: FirestorePublicReadAdapter
+): Promise<{
+  pointers: Record<DatasetKind, ActiveVersionPointerDoc | null>;
+  pointerSource: 'server' | 'offline_cache';
+}> {
+  let serverSucceeded = false;
+  let sawOfflineError = false;
+  let cachedPointersFound = 0;
+
+  const results = await Promise.all(
+    ALL_DATASET_KINDS.map(async (kind) => {
+      try {
+        const res = await adapter.getActivePointerFromServer(kind);
+        serverSucceeded = true;
+        return [kind, res.exists ? parseActivePointerDoc(kind, res.data) : null] as const;
+      } catch (err) {
+        if (!isFirestoreOfflineError(err)) {
+          throw err;
+        }
+        sawOfflineError = true;
+        try {
+          const cached = await adapter.getActivePointerFromCache(kind);
+          const parsed = cached.exists ? parseActivePointerDoc(kind, cached.data) : null;
+          if (parsed) {
+            cachedPointersFound += 1;
+          }
+          return [kind, parsed] as const;
+        } catch {
+          return [kind, null] as const;
+        }
+      }
+    })
+  );
+
+  if (sawOfflineError && serverSucceeded) {
+    throw new Error(
+      'Kết nối Cloud Firestore bị gián đoạn trong lúc xác minh phiên bản dữ liệu. Vui lòng thử lại khi mạng ổn định.'
+    );
+  }
+
+  if (sawOfflineError && cachedPointersFound === 0) {
+    throw new Error(
+      'Đang ngoại tuyến và bộ nhớ đệm cục bộ chưa có dữ liệu giá đất để tra cứu. Vui lòng kết nối mạng để tải dữ liệu chính thức.'
+    );
+  }
+
+  return {
+    pointerSource: sawOfflineError ? 'offline_cache' : 'server',
+    pointers: {
+      state_price: results.find(([k]) => k === 'state_price')?.[1] ?? null,
+      ecovis: results.find(([k]) => k === 'ecovis')?.[1] ?? null,
+      k_factor_rules: results.find(([k]) => k === 'k_factor_rules')?.[1] ?? null,
+      market_survey: results.find(([k]) => k === 'market_survey')?.[1] ?? null,
+    },
+  };
+}
 
 export async function fetchActiveVersionPointers(): Promise<
   Record<DatasetKind, ActiveVersionPointerDoc | null>
@@ -684,21 +1038,7 @@ export async function fetchActiveVersionPointers(): Promise<
       const ref = doc(db, FIRESTORE_COLLECTIONS.activeVersions, kind);
       const snap = await getDoc(ref);
       if (!snap.exists()) return [kind, null] as const;
-      const d = snap.data();
-      const pointer: ActiveVersionPointerDoc = {
-        datasetKind: kind,
-        activeVersionId: String(d.activeVersionId ?? ''),
-        versionLabel: String(d.versionLabel ?? ''),
-        sourceDocumentName: String(d.sourceDocumentName ?? ''),
-        sourceFileName: String(d.sourceFileName ?? ''),
-        effectiveDate: String(d.effectiveDate ?? ''),
-        importedAt: String(d.importedAt ?? ''),
-        rowCount: Number(d.rowCount ?? 0),
-        spatialRecordsCount: Number(d.spatialRecordsCount ?? 0),
-        notes: String(d.notes ?? ''),
-        lastEventId: String(d.lastEventId ?? ''),
-      };
-      return [kind, pointer] as const;
+      return [kind, parseActivePointerDoc(kind, snap.data())] as const;
     })
   );
 
@@ -757,61 +1097,185 @@ function mapPdfDoc(d: DocumentData): PdfReferenceDocument {
   };
 }
 
-async function fetchBoundedActiveRecordsForKind(
+/**
+ * Cache-aware loader for a single active dataset version:
+ * 1. Checks Firestore IndexedDB cache for `(datasetKind, activeVersionId)`.
+ * 2. Reuses cache ONLY when `docs.length === pointer.rowCount`, `versionId` matches,
+ *    and every record passes `validateFirestoreRecordDoc`.
+ * 3. On cache miss / count mismatch / validation error / cache query error:
+ *    - When offline: fails closed with an explicit error (never returns incomplete data).
+ *    - When online: executes ONE server query (`getDocsFromServer`), which also refreshes
+ *      the SDK's IndexedDB cache for subsequent visits.
+ */
+export async function fetchCacheAwareActiveRecordsForKind(
   kind: DatasetKind,
-  activeVersionId: string
-): Promise<Array<StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord>> {
-  const q = query(
-    collection(db, FIRESTORE_COLLECTIONS.datasetRecords),
-    where('datasetKind', '==', kind),
-    where('versionId', '==', activeVersionId),
-    where('visibility', '==', 'public'),
-    where('isDemo', '==', false),
-    limit(PUBLIC_RECORDS_QUERY_LIMIT)
-  );
-  const snap = await getDocs(q);
-  return snap.docs.map((docSnap) => deserializeFirestoreRecordDoc(docSnap.data()));
+  pointer: ActiveVersionPointerDoc | null,
+  pointerSource: 'server' | 'offline_cache' = 'server',
+  adapter: FirestorePublicReadAdapter = defaultFirestorePublicReadAdapter
+): Promise<{
+  records: Array<StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord>;
+  diagnostics: DatasetKindLoadDiagnostics;
+}> {
+  if (!pointer || !pointer.activeVersionId || pointer.rowCount <= 0) {
+    return {
+      records: [],
+      diagnostics: {
+        datasetKind: kind,
+        versionId: pointer?.activeVersionId ?? null,
+        expectedRowCount: pointer?.rowCount ?? 0,
+        loadedRowCount: 0,
+        source: 'empty',
+      },
+    };
+  }
+
+  const versionId = pointer.activeVersionId;
+  const expectedRowCount = pointer.rowCount;
+  const kindLabel = DEFAULT_CATEGORY_METADATA[kind].displayName;
+
+  let fallbackReason: CacheFallbackReason | undefined;
+  let cachedCountFound = 0;
+
+  if (expectedRowCount > PUBLIC_RECORDS_QUERY_LIMIT) {
+    fallbackReason = 'large_dataset_bounded';
+  } else {
+    try {
+      const cacheSnap = await adapter.getActiveRecordsFromCache(kind, versionId);
+      cachedCountFound = cacheSnap.docs.length;
+      const cacheCheck = validateCachedRecordSet(cacheSnap.docs, kind, versionId, expectedRowCount);
+      if (cacheCheck.ok) {
+        return {
+          records: cacheCheck.records,
+          diagnostics: {
+            datasetKind: kind,
+            versionId,
+            expectedRowCount,
+            loadedRowCount: cacheCheck.records.length,
+            source: 'cache',
+          },
+        };
+      }
+      fallbackReason = cacheCheck.reason;
+    } catch {
+      fallbackReason = 'cache_query_error';
+    }
+  }
+
+  // Offline fail-closed guard: never serve partial/unverified cache as an accurate result
+  if (pointerSource === 'offline_cache') {
+    if (expectedRowCount > PUBLIC_RECORDS_QUERY_LIMIT) {
+      throw new Error(
+        `Đang ngoại tuyến: Bộ dữ liệu "${kindLabel}" có ${expectedRowCount.toLocaleString('vi-VN')} bản ghi (vượt ngưỡng bộ nhớ đệm đầy đủ ${PUBLIC_RECORDS_QUERY_LIMIT}). Không thể tra cứu đầy đủ và chính xác khi ngoại tuyến.`
+      );
+    }
+    throw new Error(
+      `Đang ngoại tuyến và bộ nhớ đệm cục bộ không đầy đủ hoặc không hợp lệ cho "${kindLabel}" (${cachedCountFound}/${expectedRowCount} bản ghi, phiên bản ${versionId}). Không thể tra cứu đầy đủ và chính xác khi chưa kết nối lại máy chủ.`
+    );
+  }
+
+  // Online single-query server fallback (Firestore SDK automatically persists result to IndexedDB)
+  let serverSnap: FirestoreQueryReadResult;
+  try {
+    serverSnap = await adapter.getActiveRecordsFromServer(kind, versionId);
+  } catch (err) {
+    if (isFirestoreOfflineError(err)) {
+      throw new Error(
+        `Mất kết nối máy chủ Cloud Firestore khi tải "${kindLabel}" và bộ nhớ đệm cục bộ không đầy đủ (${cachedCountFound}/${expectedRowCount} bản ghi). Không thể tra cứu đầy đủ và chính xác khi chưa kết nối lại máy chủ.`
+      );
+    }
+    throw err;
+  }
+
+  const seenIds = new Set<string>();
+  const validRecords: Array<
+    StateLandPriceRecord | EcovisRecord | KFactorRuleRecord | MarketListingRecord
+  > = [];
+
+  for (const rawDoc of serverSnap.docs) {
+    if (!validateFirestoreRecordDoc(rawDoc, kind, versionId)) {
+      continue;
+    }
+    const rid = String(rawDoc.recordId);
+    if (seenIds.has(rid)) continue;
+    seenIds.add(rid);
+    validRecords.push(deserializeFirestoreRecordDoc(rawDoc));
+  }
+
+  if (expectedRowCount <= PUBLIC_RECORDS_QUERY_LIMIT && validRecords.length !== expectedRowCount) {
+    throw new Error(
+      `Dữ liệu máy chủ cho "${kindLabel}" không khớp số bản ghi đã xác minh (${validRecords.length}/${expectedRowCount}, phiên bản ${versionId}). Không thể dùng tập dữ liệu thiếu để tra cứu.`
+    );
+  }
+
+  return {
+    records: validRecords,
+    diagnostics: {
+      datasetKind: kind,
+      versionId,
+      expectedRowCount,
+      loadedRowCount: validRecords.length,
+      source: 'server',
+      fallbackReason,
+    },
+  };
 }
 
 /**
- * Loads active version pointers + active records (up to 500 per kind) + PDF catalog.
+ * Loads active version pointers + cache-aware active records (up to 500 per kind).
  * Only ever reads versions referenced by `/active_versions/{kind}` (staging versions are NEVER exposed).
+ * Reuses Firestore IndexedDB cache when versionId, rowCount, and record validation all pass.
  */
-export async function fetchPublicActiveDatasetsSnapshot(): Promise<PublicActiveDatasetsSnapshot> {
-  try {
-    const [activePointers, pdfDocuments] = await Promise.all([
-      fetchActiveVersionPointers(),
-      fetchPublicPdfDocuments(),
-    ]);
+export async function fetchPublicActiveDatasetsSnapshot(options?: {
+  adapter?: FirestorePublicReadAdapter;
+  includePdfDocuments?: boolean;
+}): Promise<PublicActiveDatasetsSnapshot> {
+  const adapter = options?.adapter ?? defaultFirestorePublicReadAdapter;
+  const includePdfDocuments = options?.includePdfDocuments === true;
 
-    const [stateRaw, ecovisRaw, kFactorRaw, marketRaw] = await Promise.all([
-      activePointers.state_price?.activeVersionId
-        ? fetchBoundedActiveRecordsForKind('state_price', activePointers.state_price.activeVersionId)
-        : Promise.resolve([]),
-      activePointers.ecovis?.activeVersionId
-        ? fetchBoundedActiveRecordsForKind('ecovis', activePointers.ecovis.activeVersionId)
-        : Promise.resolve([]),
-      activePointers.k_factor_rules?.activeVersionId
-        ? fetchBoundedActiveRecordsForKind(
-            'k_factor_rules',
-            activePointers.k_factor_rules.activeVersionId
-          )
-        : Promise.resolve([]),
-      activePointers.market_survey?.activeVersionId
-        ? fetchBoundedActiveRecordsForKind(
-            'market_survey',
-            activePointers.market_survey.activeVersionId
-          )
-        : Promise.resolve([]),
+  try {
+    const { pointers: activePointers, pointerSource } =
+      await fetchActiveVersionPointersWithMode(adapter);
+
+    const pdfPromise =
+      includePdfDocuments && pointerSource === 'server'
+        ? fetchPublicPdfDocuments().catch(() => [])
+        : Promise.resolve<PdfReferenceDocument[]>([]);
+
+    const [stateRes, ecovisRes, kFactorRes, marketRes, pdfDocuments] = await Promise.all([
+      fetchCacheAwareActiveRecordsForKind(
+        'state_price',
+        activePointers.state_price,
+        pointerSource,
+        adapter
+      ),
+      fetchCacheAwareActiveRecordsForKind(
+        'ecovis',
+        activePointers.ecovis,
+        pointerSource,
+        adapter
+      ),
+      fetchCacheAwareActiveRecordsForKind(
+        'k_factor_rules',
+        activePointers.k_factor_rules,
+        pointerSource,
+        adapter
+      ),
+      fetchCacheAwareActiveRecordsForKind(
+        'market_survey',
+        activePointers.market_survey,
+        pointerSource,
+        adapter
+      ),
+      pdfPromise,
     ]);
 
     return {
       databaseId: firestoreDatabaseId,
       activePointers,
-      statePriceRecords: stateRaw as StateLandPriceRecord[],
-      ecovisRecords: ecovisRaw as EcovisRecord[],
-      kFactorRules: kFactorRaw as KFactorRuleRecord[],
-      marketListings: marketRaw as MarketListingRecord[],
+      statePriceRecords: stateRes.records as StateLandPriceRecord[],
+      ecovisRecords: ecovisRes.records as EcovisRecord[],
+      kFactorRules: kFactorRes.records as KFactorRuleRecord[],
+      marketListings: marketRes.records as MarketListingRecord[],
       pdfDocuments,
       hasLargeDatasetRequiringTargetedQuery: {
         state_price: (activePointers.state_price?.rowCount ?? 0) > PUBLIC_RECORDS_QUERY_LIMIT,
@@ -819,8 +1283,26 @@ export async function fetchPublicActiveDatasetsSnapshot(): Promise<PublicActiveD
         k_factor_rules: (activePointers.k_factor_rules?.rowCount ?? 0) > PUBLIC_RECORDS_QUERY_LIMIT,
         market_survey: (activePointers.market_survey?.rowCount ?? 0) > PUBLIC_RECORDS_QUERY_LIMIT,
       },
+      loadMeta: {
+        pointerSource,
+        byKind: {
+          state_price: stateRes.diagnostics,
+          ecovis: ecovisRes.diagnostics,
+          k_factor_rules: kFactorRes.diagnostics,
+          market_survey: marketRes.diagnostics,
+        },
+      },
     };
   } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.message.includes('Đang ngoại tuyến') ||
+        error.message.includes('Mất kết nối máy chủ') ||
+        error.message.includes('Kết nối Cloud Firestore bị gián đoạn') ||
+        error.message.includes('không khớp số bản ghi đã xác minh'))
+    ) {
+      throw error;
+    }
     throw new Error(mapFirestoreErrorMessage(error, 'Không thể tải dữ liệu giá đất từ Cloud Firestore'));
   }
 }
@@ -846,9 +1328,15 @@ export async function queryTargetedRecordsFromFirestore(params: LookupFirestoreQ
     if (!pointer?.activeVersionId) return [];
 
     // Fast path: if active version fits within a single bounded query (<= 500 rows),
-    // fetch the full active version so both street-level and "Toàn huyện" rows match accurately.
+    // reuse cache-aware loader so both street-level and "Toàn huyện" rows match accurately.
     if (pointer.rowCount <= PUBLIC_RECORDS_QUERY_LIMIT) {
-      return fetchBoundedActiveRecordsForKind(kind, pointer.activeVersionId);
+      const loaded = await fetchCacheAwareActiveRecordsForKind(
+        kind,
+        pointer,
+        'server',
+        defaultFirestorePublicReadAdapter
+      );
+      return loaded.records;
     }
 
     const dedupMap = new Map<string, DocumentData>();
@@ -906,7 +1394,13 @@ export async function queryTargetedRecordsFromFirestore(params: LookupFirestoreQ
     }
 
     if (queriesToRun.length === 0) {
-      return fetchBoundedActiveRecordsForKind(kind, pointer.activeVersionId);
+      const loaded = await fetchCacheAwareActiveRecordsForKind(
+        kind,
+        pointer,
+        'server',
+        defaultFirestorePublicReadAdapter
+      );
+      return loaded.records;
     }
 
     await Promise.all(queriesToRun);

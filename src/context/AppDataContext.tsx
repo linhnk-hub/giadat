@@ -31,6 +31,20 @@ import {
   type ActiveVersionPointerDoc,
 } from '../services/firestoreDatasetStore';
 import { detectDuplicateMarketListings } from '../utils/formatters';
+import {
+  APP_NAVIGATE_EVENT,
+  getCurrentPathname,
+  isAdminPath,
+} from '../utils/navigation';
+
+/**
+ * Pure route guard determining whether public land-price datasets should be
+ * auto-loaded from Cloud Firestore. Strictly returns `false` on `/admin` (and
+ * `/<base>/admin`) so opening Admin never triggers 423 public record reads.
+ */
+export function shouldLoadPublicDatasetsForPath(pathname: string, baseUrl?: string): boolean {
+  return !isAdminPath(pathname, baseUrl);
+}
 
 const STORAGE_KEY_DATASETS = 'khanh_hoa_land_real_datasets_v1';
 const STORAGE_KEY_DOSSIERS = 'khanh_hoa_land_dossiers_v1';
@@ -334,6 +348,7 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
       });
       setServerDatasetStatus('synced');
     } catch (error) {
+      setServerSnapshot(null);
       setServerDatasetStatus('offline');
       setFirestoreError(
         error instanceof Error
@@ -343,9 +358,27 @@ export const AppDataProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }
   }, []);
 
+  const [isPublicRoute, setIsPublicRoute] = useState<boolean>(() =>
+    shouldLoadPublicDatasetsForPath(getCurrentPathname())
+  );
+
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const syncRoute = () => {
+      setIsPublicRoute(shouldLoadPublicDatasetsForPath(getCurrentPathname()));
+    };
+    window.addEventListener('popstate', syncRoute);
+    window.addEventListener(APP_NAVIGATE_EVENT, syncRoute);
+    return () => {
+      window.removeEventListener('popstate', syncRoute);
+      window.removeEventListener(APP_NAVIGATE_EVENT, syncRoute);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPublicRoute) return;
     void refreshServerDatasets();
-  }, [refreshServerDatasets]);
+  }, [isPublicRoute, refreshServerDatasets]);
 
   // Real operational dossiers persisted in localStorage (legacy dossiers loaded intact without silent deletion)
   const [realDossiers, setRealDossiers] = useState<AppraisalDossier[]>(() => {

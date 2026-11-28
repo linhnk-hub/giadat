@@ -14,7 +14,6 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import { useAppData } from '../../context/AppDataContext';
 import { firestoreDatabaseId } from '../../firebase';
 import {
   activateOrRollbackDatasetVersion,
@@ -84,8 +83,6 @@ function getKindLabel(kind: DatasetKind): string {
 }
 
 export const DataManagementModule: React.FC = () => {
-  const { refreshServerDatasets } = useAppData();
-
   // Firestore Admin Overview State
   const [overview, setOverview] = useState<AdminOverviewSnapshot | null>(null);
   const [loadingOverview, setLoadingOverview] = useState(true);
@@ -230,7 +227,7 @@ export const DataManagementModule: React.FC = () => {
       setPreview(null);
       setVersionLabel('');
       setNotes('');
-      await Promise.all([loadOverview(), refreshServerDatasets()]);
+      await loadOverview();
     } catch (err) {
       setActionBanner({
         type: 'error',
@@ -263,7 +260,7 @@ export const DataManagementModule: React.FC = () => {
             ? `Đã khôi phục phiên bản ${res.toVersionId} cho nhóm ${getKindLabel(ver.datasetKind)} (mã kiểm toán ${res.eventId}).`
             : `Đã kích hoạt phiên bản ${res.toVersionId} cho nhóm ${getKindLabel(ver.datasetKind)}.`,
       });
-      await Promise.all([loadOverview(), refreshServerDatasets()]);
+      await loadOverview();
     } catch (err) {
       setActionBanner({
         type: 'error',
@@ -335,7 +332,7 @@ export const DataManagementModule: React.FC = () => {
         type: 'success',
         message: 'Đã lưu thông tin tài liệu PDF nguồn vào Cloud Firestore.',
       });
-      await Promise.all([loadOverview(), refreshServerDatasets()]);
+      await loadOverview();
     } catch (err) {
       setActionBanner({
         type: 'error',
@@ -354,7 +351,7 @@ export const DataManagementModule: React.FC = () => {
         type: 'success',
         message: `Đã xóa mục tài liệu PDF (${docId}) khỏi danh mục.`,
       });
-      await Promise.all([loadOverview(), refreshServerDatasets()]);
+      await loadOverview();
     } catch (err) {
       setActionBanner({
         type: 'error',
